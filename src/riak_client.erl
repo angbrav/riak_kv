@@ -190,17 +190,17 @@ get(Bucket, Key, R, Timeout, {?MODULE, [_Node, _ClientId]}=THIS) when
 %%      Return as soon as the default W value number of nodes for this bucket
 %%      nodes have received the request.
 %% @equiv put(RObj, [])
-put(RObj, {?MODULE, [_Node, _ClientId]}=THIS) -> put(RObj, [], THIS).
+put(RObj, {?MODULE, [_Node, _ClientId]}=THIS) -> put(RObj, no_dependences, [], THIS).
 
 
-normal_put(RObj, Options, {?MODULE, [Node, ClientId]}) ->
+normal_put(RObj, CausalClock, Options, {?MODULE, [Node, ClientId]}) ->
     Me = self(),
     ReqId = mk_reqid(),
     case ClientId of
         undefined ->
             case node() of
                 Node ->
-                    riak_kv_put_fsm:start_link({raw, ReqId, Me}, RObj, Options);
+                    riak_kv_put_fsm:start_link({raw, ReqId, Me}, CausalClock, RObj, Options);
                 _ ->
                     proc_lib:spawn_link(Node, riak_kv_put_fsm, start_link,
                                         [{raw, ReqId, Me}, RObj, Options])
@@ -209,7 +209,7 @@ normal_put(RObj, Options, {?MODULE, [Node, ClientId]}) ->
             UpdObj = riak_object:increment_vclock(RObj, ClientId),
             case node() of
                 Node ->
-                    riak_kv_put_fsm:start_link({raw, ReqId, Me}, UpdObj, [asis|Options]);
+                    riak_kv_put_fsm:start_link({raw, ReqId, Me}, CausalClock, UpdObj, [asis|Options]);
                 _ ->
                     proc_lib:spawn_link(Node, riak_kv_put_fsm, start_link,
                                         [{raw, ReqId, Me}, RObj, [asis|Options]])
@@ -262,6 +262,17 @@ consistent_put_type(RObj, Options) ->
             put_once
     end.
 
+
+%% @spec put(RObj :: riak_object:riak_object(), W :: integer(), riak_client()) ->
+%%        ok |
+%%       {error, too_many_fails} |
+%%       {error, timeout} |
+%%       {error, {n_val_violation, N::integer()}}
+%% @doc Store RObj in the cluster.
+%%      Return as soon as at least W nodes have received the request.
+%% @equiv put(RObj, [{w, W}, {dw, W}])
+put(RObj, W, {?MODULE, [_Node, _ClientId]}=THIS) -> put(RObj, no_dependences, [{w, W}, {dw, W}], THIS).
+
 %% @spec put(RObj :: riak_object:riak_object(), riak_kv_put_fsm:options(), riak_client()) ->
 %%       ok |
 %%       {ok, details()} |
@@ -273,25 +284,15 @@ consistent_put_type(RObj, Options) ->
 %%       {error, Err :: term()} |
 %%       {error, Err :: term(), details()}
 %% @doc Store RObj in the cluster.
-put(RObj, Options, {?MODULE, [Node, _ClientId]}=THIS) when is_list(Options) ->
+put(RObj, CausalClock, Options, {?MODULE, [Node, _ClientId]}=THIS) when is_list(Options) ->
     case consistent_object(Node, riak_object:bucket(RObj)) of
         true ->
             consistent_put(RObj, Options, THIS);
         false ->
-            normal_put(RObj, Options, THIS);
+            normal_put(RObj, CausalClock, Options, THIS);
         {error,_}=Err ->
             Err
     end;
-
-%% @spec put(RObj :: riak_object:riak_object(), W :: integer(), riak_client()) ->
-%%        ok |
-%%       {error, too_many_fails} |
-%%       {error, timeout} |
-%%       {error, {n_val_violation, N::integer()}}
-%% @doc Store RObj in the cluster.
-%%      Return as soon as at least W nodes have received the request.
-%% @equiv put(RObj, [{w, W}, {dw, W}])
-put(RObj, W, {?MODULE, [_Node, _ClientId]}=THIS) -> put(RObj, [{w, W}, {dw, W}], THIS).
 
 %% @spec put(RObj::riak_object:riak_object(),W :: integer(),RW :: integer(), riak_client()) ->
 %%        ok |
@@ -302,7 +303,7 @@ put(RObj, W, {?MODULE, [_Node, _ClientId]}=THIS) -> put(RObj, [{w, W}, {dw, W}],
 %%      Return as soon as at least W nodes have received the request, and
 %%      at least DW nodes have stored it in their storage backend.
 %% @equiv put(Robj, W, DW, default_timeout())
-put(RObj, W, DW, {?MODULE, [_Node, _ClientId]}=THIS) -> put(RObj, [{w, W}, {dw, DW}], THIS).
+put(RObj, W, DW, {?MODULE, [_Node, _ClientId]}=THIS) -> put(RObj, no_dependences, [{w, W}, {dw, DW}], THIS).
 
 %% @spec put(RObj::riak_object:riak_object(), W :: integer(), RW :: integer(),
 %%           TimeoutMillisecs :: integer(), riak_client()) ->
@@ -315,7 +316,7 @@ put(RObj, W, DW, {?MODULE, [_Node, _ClientId]}=THIS) -> put(RObj, [{w, W}, {dw, 
 %%      at least DW nodes have stored it in their storage backend, or
 %%      TimeoutMillisecs passes.
 put(RObj, W, DW, Timeout, {?MODULE, [_Node, _ClientId]}=THIS) ->
-    put(RObj,  [{w, W}, {dw, DW}, {timeout, Timeout}], THIS).
+    put(RObj, no_dependencies, [{w, W}, {dw, DW}, {timeout, Timeout}], THIS).
 
 %% @spec put(RObj::riak_object:riak_object(), W :: integer(), RW :: integer(),
 %%           TimeoutMillisecs :: integer(), Options::list(), riak_client()) ->
@@ -328,7 +329,7 @@ put(RObj, W, DW, Timeout, {?MODULE, [_Node, _ClientId]}=THIS) ->
 %%      at least DW nodes have stored it in their storage backend, or
 %%      TimeoutMillisecs passes.
 put(RObj, W, DW, Timeout, Options, {?MODULE, [_Node, _ClientId]}=THIS) ->
-    put(RObj, [{w, W}, {dw, DW}, {timeout, Timeout} | Options], THIS).
+    put(RObj, no_dependences, [{w, W}, {dw, DW}, {timeout, Timeout} | Options], THIS).
 
 %% @spec delete(riak_object:bucket(), riak_object:key(), riak_client()) ->
 %%        ok |

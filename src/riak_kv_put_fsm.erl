@@ -110,7 +110,9 @@
                 trace = false :: boolean(), 
                 tracked_bucket=false :: boolean(), %% track per bucket stats
                 bad_coordinators = [] :: [atom()],
-                coordinator_timeout :: integer()
+                coordinator_timeout :: integer(),
+                op_ts :: integer(),
+                causal_clock :: integer()
                }).
 
 -include("riak_kv_dtrace.hrl").
@@ -147,6 +149,25 @@ start_link(From, Object, PutOptions) ->
             gen_fsm:start_link(?MODULE, Args, []);
         _ ->
             Args = [From, Object, PutOptions, false],
+            case sidejob_supervisor:start_child(riak_kv_put_fsm_sj,
+                                                gen_fsm, start_link,
+                                                [?MODULE, Args, []]) of
+                {error, overload} ->
+                    riak_kv_util:overload_reply(From),
+                    {error, overload};
+                {ok, Pid} ->
+                    {ok, Pid}
+            end
+    end.
+
+start_link(From, CausalClock, Object, PutOptions) ->
+    case whereis(riak_kv_put_fsm_sj) of
+        undefined ->
+            %% Overload protection disabled
+            Args = [From, CausalClock, Object, PutOptions, true],
+            gen_fsm:start_link(?MODULE, Args, []);
+        _ ->
+            Args = [From, CausalClock, Object, PutOptions, false],
             case sidejob_supervisor:start_child(riak_kv_put_fsm_sj,
                                                 gen_fsm, start_link,
                                                 [?MODULE, Args, []]) of
@@ -230,16 +251,23 @@ test_link(From, Object, PutOptions, StateProps) ->
 %% ====================================================================
 
 %% @private
-init([From, RObj, Options0, Monitor]) ->
+init([From, CausalClock, RObj, Options0, Monitor]) ->
     BKey = {Bucket, Key} = {riak_object:bucket(RObj), riak_object:key(RObj)},
     CoordTimeout = get_put_coordinator_failure_timeout(),
     Trace = app_helper:get_env(riak_kv, fsm_trace_enabled),
     Options = proplists:unfold(Options0),
+    case CausalClock of
+    no_dependencies ->
+        CausalClock2 = 0;
+    _ ->
+        CausalClock2 - CausalClock
+    end,
     StateData = #state{from = From,
                        robj = RObj,
                        bkey = BKey,
                        trace = Trace,
                        options = Options,
+                       causal_clock = CausalClock2, 
                        timing = riak_kv_fsm_timing:add_timing(prepare, []),
                        coordinator_timeout=CoordTimeout},
     (Monitor =:= true) andalso riak_kv_get_put_monitor:put_fsm_spawned(self()),
@@ -372,12 +400,15 @@ prepare(timeout, StateData0 = #state{from = From, robj = RObj,
                                     {_Idx, Nd} -> atom2list(Nd)
                                 end,
                     %% This node is in the preference list, continue
-                    StartTime = riak_core_util:moment(),
+                    %%StartTime = riak_core_util:moment(),
+                    %%TimeStamp = riak_kv_vnode:get_op_ts(ClientClock),
+                    TimeStamp = 1,
                     StateData = StateData0#state{n = N,
                                                 bucket_props = Props,
                                                 coord_pl_entry = CoordPLEntry,
                                                 preflist2 = Preflist2,
                                                 starttime = StartTime,
+                                                op_ts = TimeStamp,
                                                 tracked_bucket = StatTracked},
                     ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [0], 
                             ["prepare", CoordPlNode]),
