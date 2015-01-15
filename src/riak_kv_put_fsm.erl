@@ -34,7 +34,7 @@
 -behaviour(gen_fsm).
 -define(DEFAULT_OPTS, [{returnbody, false}, {update_last_modified, true}]).
 -export([start/3, start/6,start/7]).
--export([start_link/3,start_link/6,start_link/7]).
+-export([start_link/3,start_link/4,start_link/6,start_link/7]).
 -export([set_put_coordinator_failure_timeout/1,
          get_put_coordinator_failure_timeout/0]).
 -ifdef(TEST).
@@ -260,7 +260,7 @@ init([From, CausalClock, RObj, Options0, Monitor]) ->
     no_dependencies ->
         CausalClock2 = 0;
     _ ->
-        CausalClock2 - CausalClock
+        CausalClock2 = CausalClock
     end,
     StateData = #state{from = From,
                        robj = RObj,
@@ -400,7 +400,7 @@ prepare(timeout, StateData0 = #state{from = From, robj = RObj,
                                     {_Idx, Nd} -> atom2list(Nd)
                                 end,
                     %% This node is in the preference list, continue
-                    %%StartTime = riak_core_util:moment(),
+                    StartTime = riak_core_util:moment(),
                     %%TimeStamp = riak_kv_vnode:get_op_ts(ClientClock),
                     TimeStamp = 1,
                     StateData = StateData0#state{n = N,
