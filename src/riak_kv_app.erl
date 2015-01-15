@@ -46,7 +46,7 @@
 %% @doc The application:start callback for riak.
 %%      Arguments are ignored as all configuration is done via the erlenv file.
 start(_Type, _StartArgs) ->
-    lager:error("Manuel bravo modified version"),
+    lager:error("Manuel bravo modified versioni 2.0"),
     riak_core_util:start_app_deps(riak_kv),
 
     FSM_Limit = app_helper:get_env(riak_kv, fsm_limit, ?DEFAULT_FSM_LIMIT),
