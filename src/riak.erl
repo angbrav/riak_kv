@@ -104,6 +104,7 @@ client_connect(Node, ClientId= <<_:32>>) ->
             %% or the new vnode based vclocks should be used.
             %% N.B. all nodes must be upgraded to 1.0 before
             %% this can be enabled.
+            lager:error("Using modified version"),
             case vnode_vclocks(Node) of
                 {badrpc, _Reason} ->
                     {error, {could_not_reach_node, Node}};
