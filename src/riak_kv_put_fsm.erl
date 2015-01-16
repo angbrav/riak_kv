@@ -32,6 +32,7 @@
 -include("riak_kv_types.hrl").
 
 -behaviour(gen_fsm).
+-define(GET_OP_TS_TIMEOUT, infinity).
 -define(DEFAULT_OPTS, [{returnbody, false}, {update_last_modified, true}]).
 -export([start/3, start/6,start/7]).
 -export([start_link/3,start_link/4,start_link/6,start_link/7]).
@@ -403,18 +404,27 @@ prepare(timeout, StateData0 = #state{from = From, robj = RObj,
                     %% This node is in the preference list, continue
                     StartTime = riak_core_util:moment(),
                     lager:info("Causal clock: ~p\n", [CausalClock]),
-                    %%TimeStamp = riak_kv_vnode:get_op_ts(CausalClock),
-                    TimeStamp = 1,
-                    StateData = StateData0#state{n = N,
-                                                bucket_props = Props,
-                                                coord_pl_entry = CoordPLEntry,
-                                                preflist2 = Preflist2,
-                                                starttime = StartTime,
-                                                op_ts = TimeStamp,
-                                                tracked_bucket = StatTracked},
-                    ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [0], 
+                    try 
+                        {ok, TimeStamp} = riak_kv_vnode:get_op_ts(CoordPLEntry, CausalClock, ?GET_OP_TS_TIMEOUT),
+                        lager:info("Operation time_stamp: ~p\n", [TimeStamp]),
+                        StateData = StateData0#state{n = N,
+                                                    bucket_props = Props,
+                                                    coord_pl_entry = CoordPLEntry,
+                                                    preflist2 = Preflist2,
+                                                    starttime = StartTime,
+                                                    op_ts = TimeStamp,
+                                                    tracked_bucket = StatTracked},
+                        ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [0], 
                             ["prepare", CoordPlNode]),
-                    new_state_timeout(validate, StateData)
+                        new_state_timeout(validate, StateData)
+                    catch
+                       _:Reason -> 
+                            ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-2],
+                                    ["prepare", dtrace_errstr(Reason)]),
+                            lager:error("Unable to get put_timestamp from vnode for ~p to ~p - ~p @ ~p\n",
+                                        [BKey, CoordPLEntry, Reason, erlang:get_stacktrace()]),
+                            process_reply({error, {coord_handoff_failed, Reason}}, StateData0)
+                    end
             end
     end.
 

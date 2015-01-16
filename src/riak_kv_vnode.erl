@@ -34,6 +34,7 @@
          local_put/2,
          local_put/3,
          coord_put/6,
+         get_op_ts/3,
          readrepair/6,
          list_keys/4,
          fold/3,
@@ -126,6 +127,7 @@
                 forward :: node() | [{integer(), node()}],
                 hashtrees :: pid(),
                 md_cache :: ets:tab(),
+                max_ts :: integer(),
                 md_cache_size :: pos_integer() }).
 
 -type index_op() :: add | remove.
@@ -280,6 +282,12 @@ coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options, Sender)
                                    Sender,
                                    riak_kv_vnode_master).
 
+get_op_ts(IndexNode, CausalClock, TimeOut) ->
+    riak_core_vnode_master:sync_command(IndexNode,
+                                        {get_op_ts, CausalClock},
+                                        riak_kv_vnode_master,
+                                        TimeOut).
+
 %% Do a put without sending any replies
 readrepair(Preflist, BKey, Obj, ReqId, StartTime, Options) ->
     put(Preflist, BKey, Obj, ReqId, StartTime, [rr | Options], ignore).
@@ -402,6 +410,7 @@ init([Index]) ->
     DeleteMode = app_helper:get_env(riak_kv, delete_mode, 3000),
     AsyncFolding = app_helper:get_env(riak_kv, async_folds, true) == true,
     MDCacheSize = app_helper:get_env(riak_kv, vnode_md_cache_size),
+    MaxTS = now_milisec(erlang:now()),
     MDCache =
         case MDCacheSize of
             N when is_integer(N),
@@ -427,6 +436,7 @@ init([Index]) ->
                            key_buf_size=KeyBufSize,
                            mrjobs=dict:new(),
                            md_cache=MDCache,
+                           max_ts=MaxTS,
                            md_cache_size=MDCacheSize},
             try_set_vnode_lock_limit(Index),
             case AsyncFolding of
@@ -632,6 +642,10 @@ handle_command({refresh_index_data, BKey, OldIdxData}, Sender,
         false ->
             {reply, {error, {indexes_not_supported, Mod}}, State}
     end;
+
+handle_command({get_op_ts, CausalClock}, _Sender, State=#state{max_ts=MaxTS}) ->
+    NextTS=max(now_milisec(erlang:now()), max(MaxTS + 1, CausalClock + 1)),
+    {reply, {ok, NextTS}, State#state{max_ts=NextTS}};
 
 handle_command({fold_indexes, FoldIndexFun, Acc}, Sender, State=#state{mod=Mod, modstate=ModState}) ->
     {ok, Caps} = Mod:capabilities(ModState),
@@ -2282,6 +2296,9 @@ new_md_cache(VId) ->
     %% ordered set to make sure that the first key is the oldest
     %% term format is {TimeStamp, Key, ValueTuple}
     ets:new(MDCacheName, [ordered_set, {keypos,2}]).
+
+now_milisec({MegaSecs, Secs, MicroSecs}) ->
+    (MegaSecs * 1000000 + Secs) * 1000000 + MicroSecs.
 
 -ifdef(TEST).
 
