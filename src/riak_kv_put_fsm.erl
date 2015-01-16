@@ -145,10 +145,10 @@ start_link(From, Object, PutOptions) ->
     case whereis(riak_kv_put_fsm_sj) of
         undefined ->
             %% Overload protection disabled
-            Args = [From, Object, PutOptions, true],
+            Args = [From, no_dependencies, Object, PutOptions, true],
             gen_fsm:start_link(?MODULE, Args, []);
         _ ->
-            Args = [From, Object, PutOptions, false],
+            Args = [From, no_dependencies, Object, PutOptions, false],
             case sidejob_supervisor:start_child(riak_kv_put_fsm_sj,
                                                 gen_fsm, start_link,
                                                 [?MODULE, Args, []]) of

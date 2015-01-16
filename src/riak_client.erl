@@ -190,7 +190,7 @@ get(Bucket, Key, R, Timeout, {?MODULE, [_Node, _ClientId]}=THIS) when
 %%      Return as soon as the default W value number of nodes for this bucket
 %%      nodes have received the request.
 %% @equiv put(RObj, [])
-put(RObj, {?MODULE, [_Node, _ClientId]}=THIS) -> put(RObj, no_dependences, [], THIS).
+put(RObj, {?MODULE, [_Node, _ClientId]}=THIS) -> put(RObj, no_dependencies, [], THIS).
 
 
 normal_put(RObj, CausalClock, Options, {?MODULE, [Node, ClientId]}) ->
@@ -271,7 +271,7 @@ consistent_put_type(RObj, Options) ->
 %% @doc Store RObj in the cluster.
 %%      Return as soon as at least W nodes have received the request.
 %% @equiv put(RObj, [{w, W}, {dw, W}])
-put(RObj, W, {?MODULE, [_Node, _ClientId]}=THIS) -> put(RObj, no_dependences, [{w, W}, {dw, W}], THIS).
+put(RObj, W, {?MODULE, [_Node, _ClientId]}=THIS) -> put(RObj, no_dependencies, [{w, W}, {dw, W}], THIS).
 
 %% @spec put(RObj :: riak_object:riak_object(), riak_kv_put_fsm:options(), riak_client()) ->
 %%       ok |
@@ -303,7 +303,7 @@ put(RObj, CausalClock, Options, {?MODULE, [Node, _ClientId]}=THIS) when is_list(
 %%      Return as soon as at least W nodes have received the request, and
 %%      at least DW nodes have stored it in their storage backend.
 %% @equiv put(Robj, W, DW, default_timeout())
-put(RObj, W, DW, {?MODULE, [_Node, _ClientId]}=THIS) -> put(RObj, no_dependences, [{w, W}, {dw, DW}], THIS).
+put(RObj, W, DW, {?MODULE, [_Node, _ClientId]}=THIS) -> put(RObj, no_dependencies, [{w, W}, {dw, DW}], THIS).
 
 %% @spec put(RObj::riak_object:riak_object(), W :: integer(), RW :: integer(),
 %%           TimeoutMillisecs :: integer(), riak_client()) ->
@@ -329,7 +329,7 @@ put(RObj, W, DW, Timeout, {?MODULE, [_Node, _ClientId]}=THIS) ->
 %%      at least DW nodes have stored it in their storage backend, or
 %%      TimeoutMillisecs passes.
 put(RObj, W, DW, Timeout, Options, {?MODULE, [_Node, _ClientId]}=THIS) ->
-    put(RObj, no_dependences, [{w, W}, {dw, DW}, {timeout, Timeout} | Options], THIS).
+    put(RObj, no_dependencies, [{w, W}, {dw, DW}, {timeout, Timeout} | Options], THIS).
 
 %% @spec delete(riak_object:bucket(), riak_object:key(), riak_client()) ->
 %%        ok |
