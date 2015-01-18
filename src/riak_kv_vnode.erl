@@ -35,6 +35,8 @@
          local_put/3,
          coord_put/6,
          get_op_ts/3,
+         send_heartbeat/1,
+         compute_monotonic_clock/1,
          readrepair/6,
          list_keys/4,
          fold/3,
@@ -128,6 +130,8 @@
                 hashtrees :: pid(),
                 md_cache :: ets:tab(),
                 max_ts :: integer(),
+                heartbeat_alarm :: {pid(), reference()},
+                monotonic_clock_alarm :: {pid(), reference()},
                 md_cache_size :: pos_integer() }).
 
 -type index_op() :: add | remove.
@@ -288,6 +292,18 @@ get_op_ts(IndexNode, CausalClock, TimeOut) ->
                                         riak_kv_vnode_master,
                                         TimeOut).
 
+send_heartbeat(IndexNode) ->
+    riak_core_vnode_master:command(IndexNode,
+                                   send_heartbeat,
+                                   {undefined, undefined, self()},
+                                   riak_kv_vnode_master).
+                               
+compute_monotonic_clock(IndexNode) ->
+    riak_core_vnode_master:command(IndexNode,
+                                   compute_monotonic_clock,
+                                   {undefined, undefined, self()},
+                                   riak_kv_vnode_master).
+
 %% Do a put without sending any replies
 readrepair(Preflist, BKey, Obj, ReqId, StartTime, Options) ->
     put(Preflist, BKey, Obj, ReqId, StartTime, [rr | Options], ignore).
@@ -410,7 +426,11 @@ init([Index]) ->
     DeleteMode = app_helper:get_env(riak_kv, delete_mode, 3000),
     AsyncFolding = app_helper:get_env(riak_kv, async_folds, true) == true,
     MDCacheSize = app_helper:get_env(riak_kv, vnode_md_cache_size),
+    %%Init the maximum timestamp seen to the initial physical clock time
     MaxTS = now_milisec(erlang:now()),
+    %%Start alarms
+    HeartbeatAlarm = spawn_monitor(alarm, loop, [?HEARTBEAT_FREQUENCY, riak_kv_vnode, send_heartbeat, {Index, node()}]), 
+    MonotonicAlarm = spawn_monitor(alarm, loop, [?MONOTONIC_CLOCK_FREQUENCY, riak_kv_vnode, compute_monotonic_clock, {Index, node()}]), 
     MDCache =
         case MDCacheSize of
             N when is_integer(N),
@@ -437,6 +457,8 @@ init([Index]) ->
                            mrjobs=dict:new(),
                            md_cache=MDCache,
                            max_ts=MaxTS,
+                           heartbeat_alarm=HeartbeatAlarm,
+                           monotonic_clock_alarm=MonotonicAlarm,
                            md_cache_size=MDCacheSize},
             try_set_vnode_lock_limit(Index),
             case AsyncFolding of
@@ -646,6 +668,14 @@ handle_command({refresh_index_data, BKey, OldIdxData}, Sender,
 handle_command({get_op_ts, CausalClock}, _Sender, State=#state{max_ts=MaxTS}) ->
     NextTS=max(now_milisec(erlang:now()), max(MaxTS + 1, CausalClock + 1)),
     {reply, {ok, NextTS}, State#state{max_ts=NextTS}};
+
+handle_command(send_heartbeat, _Sender, State) ->
+    lager:info("Sending heartbeats"),
+    {noreply, State};
+
+handle_command(compute_monotonic_clock, _Sender, State) ->
+    lager:info("Computing monotonic clocks"),
+    {noreply, State};
 
 handle_command({fold_indexes, FoldIndexFun, Acc}, Sender, State=#state{mod=Mod, modstate=ModState}) ->
     {ok, Caps} = Mod:capabilities(ModState),
@@ -1043,6 +1073,23 @@ delete(State=#state{idx=Index,mod=Mod, modstate=ModState}) ->
 terminate(_Reason, #state{mod=Mod, modstate=ModState}) ->
     Mod:stop(ModState),
     ok.
+
+handle_info({'DOWN', Ref, process, Pid2, Reason},State=#state{monotonic_clock_alarm=MonotonicAlarm,
+                                                                heartbeat_alarm=HeartbeatAlarm,
+                                                                idx=Index}) ->
+    case {Pid2, Ref} of
+    HeartbeatAlarm ->
+        lager:error("Hearbeat_alarm with pid ~p and monitor reference ~p exited with reason: ~p\n", [Pid2, Ref, Reason]),
+        HeartbeatAlarmNew = spawn_monitor(alarm, loop, [?HEARTBEAT_FREQUENCY, riak_kv_vnode, send_heartbeat, {Index, node()}]), 
+        {ok, State#state{heartbeat_alarm=HeartbeatAlarmNew}};
+    MonotonicAlarm ->
+        lager:error("Monotonic_clock_alarm with pid ~p and monitor reference ~p exited with reason: ~p\n", [Pid2, Ref, Reason]),
+        MonotonicAlarmNew = spawn_monitor(alarm, loop, [?MONOTONIC_CLOCK_FREQUENCY, riak_kv_vnode, compute_monotonic_clock, {Index, node()}]), 
+        {ok, State#state{monotonic_clock_alarm=MonotonicAlarmNew}};
+    _ ->
+        lager:error("Unknown process with pid ~p and monitor reference ~p exited with reason: ~p\n", [Pid2, Ref, Reason]),
+        {ok, State}
+    end;
 
 handle_info({set_concurrency_limit, Lock, Limit}, State) ->
     try_set_concurrency_limit(Lock, Limit),
