@@ -33,6 +33,7 @@
 
 -behaviour(gen_fsm).
 -define(GET_OP_TS_TIMEOUT, infinity).
+-define(UPDATE_PROPAGATION_TIMEOUT, infinity).
 -define(DEFAULT_OPTS, [{returnbody, false}, {update_last_modified, true}]).
 -export([start/3, start/6,start/7]).
 -export([start_link/3,start_link/4,start_link/6,start_link/7]).
@@ -654,15 +655,24 @@ execute_remote(StateData=#state{robj=RObj, req_id = ReqId,
             _ ->
                 StateData
         end,
-    riak_kv_vnode:put(Preflist, BKey, RObj, ReqId, StartTime, VnodeOptions),
-    case riak_kv_put_core:enough(PutCore) of
-        true ->
-            {Reply, UpdPutCore} = riak_kv_put_core:response(PutCore),
-            process_reply(Reply, StateData1#state{putcore = UpdPutCore});
-        false ->
-            new_state(waiting_remote_vnode, StateData1)
+    %riak_kv_vnode:put(Preflist, BKey, RObj, ReqId, StartTime, VnodeOptions),
+    try
+        riak_kv_vnode:propagate_update(CoordPLEntry, Preflist, BKey, RObj, ReqId, StartTime, VnodeOptions, ?UPDATE_PROPAGATION_TIMEOUT),
+        case riak_kv_put_core:enough(PutCore) of
+            true ->
+                {Reply, UpdPutCore} = riak_kv_put_core:response(PutCore),
+                process_reply(Reply, StateData1#state{putcore = UpdPutCore});
+            false ->
+                new_state(waiting_remote_vnode, StateData1)
+        end
+    catch
+        _:Reason ->
+            ?DTRACE(Trace, ?C_PUT_FSM_EXECUTE_REMOTE, [-2],
+                        ["execute_remote", dtrace_errstr(Reason)]),
+            lager:error("Unable to reach local node ~p for update propagation due to ~p @ ~p\n",
+                        [CoordPLEntry, Reason, erlang:get_stacktrace()]),
+            process_reply({error, {coord_propagation_failed, Reason}}, StateData1)
     end.
-
 
 %% @private
 waiting_remote_vnode(request_timeout, StateData=#state{trace = Trace}) ->

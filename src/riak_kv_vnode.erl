@@ -37,6 +37,7 @@
          get_op_ts/3,
          send_heartbeat/1,
          compute_monotonic_clock/1,
+         propagate_update/8,
          readrepair/6,
          list_keys/4,
          fold/3,
@@ -132,6 +133,8 @@
                 max_ts :: integer(),
                 heartbeat_alarm :: {pid(), reference()},
                 monotonic_clock_alarm :: {pid(), reference()},
+                latest_ts_given :: integer(),
+                pending_update :: boolean(),
                 md_cache_size :: pos_integer() }).
 
 -type index_op() :: add | remove.
@@ -289,6 +292,12 @@ coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options, Sender)
 get_op_ts(IndexNode, CausalClock, TimeOut) ->
     riak_core_vnode_master:sync_command(IndexNode,
                                         {get_op_ts, CausalClock},
+                                        riak_kv_vnode_master,
+                                        TimeOut).
+
+propagate_update(IndexNode, Preflist, BKey, Obj, ReqId, StartTime, Options, TimeOut) ->
+    riak_core_vnode_master:sync_command(IndexNode,
+                                        {propagate_update, Preflist, BKey, Obj, ReqId, StartTime, Options},
                                         riak_kv_vnode_master,
                                         TimeOut).
 
@@ -667,7 +676,12 @@ handle_command({refresh_index_data, BKey, OldIdxData}, Sender,
 
 handle_command({get_op_ts, CausalClock}, _Sender, State=#state{max_ts=MaxTS}) ->
     NextTS=max(now_milisec(erlang:now()), max(MaxTS + 1, CausalClock + 1)),
-    {reply, {ok, NextTS}, State#state{max_ts=NextTS}};
+    LatestTSGiven=NextTS, 
+    {reply, {ok, NextTS}, State#state{max_ts=NextTS, latest_ts_given=LatestTSGiven, pending_update=true}};
+
+handle_command({propagate_update, Preflist, BKey, Obj, ReqId, StartTime, Options}, Sender, State) ->
+    riak_kv_vnode:put(Preflist, BKey, Obj, ReqId, StartTime, Options, Sender),
+    {noreply, State#state{pending_update=false}};
 
 handle_command(send_heartbeat, _Sender, State) ->
     lager:info("Sending heartbeats"),
