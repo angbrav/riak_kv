@@ -28,12 +28,11 @@
 %-endif.
 -include_lib("riak_kv_vnode.hrl").
 -include_lib("riak_kv_js_pools.hrl").
+-include_lib("riak_kv_causal.hrl").
 -include("riak_kv_wm_raw.hrl").
 -include("riak_kv_types.hrl").
 
 -behaviour(gen_fsm).
--define(GET_OP_TS_TIMEOUT, infinity).
--define(UPDATE_PROPAGATION_TIMEOUT, infinity).
 -define(DEFAULT_OPTS, [{returnbody, false}, {update_last_modified, true}]).
 -export([start/3, start/6,start/7]).
 -export([start_link/3,start_link/4,start_link/6,start_link/7]).
@@ -326,16 +325,17 @@ prepare(timeout, StateData0 = #state{from = From, robj = RObj,
                 BucketProps
         end,
     DocIdx = riak_core_util:chash_key(BKey, BucketProps),
-    Bucket_N = get_option(n_val, BucketProps),
-    N = case get_option(n_val, Options, false) of
-            false ->
-                Bucket_N;
-            N_val when is_integer(N_val), N_val > 0, N_val =< Bucket_N ->
+    %Bucket_N = get_option(n_val, BucketProps),
+    %N = case get_option(n_val, Options, false) of
+    %        false ->
+    %            Bucket_N;
+    %        N_val when is_integer(N_val), N_val > 0, N_val =< Bucket_N ->
                 %% don't allow custom N to exceed bucket N
-                N_val;
-            Bad_N ->
-                {error, {n_val_violation, Bad_N}}
-        end,
+    %            N_val;
+    %        Bad_N ->
+    %            {error, {n_val_violation, Bad_N}}
+    %    end,
+    N = ?FIXED_N_VAL,
     case N of
         {error, _} = Error ->
             process_reply(Error, StateData0);

@@ -1,0 +1,3 @@
+-define(FIXED_N_VAL, 3).
+-define(GET_OP_TS_TIMEOUT, infinity).
+-define(UPDATE_PROPAGATION_TIMEOUT, infinity).

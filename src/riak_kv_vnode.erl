@@ -38,6 +38,7 @@
          send_heartbeat/1,
          compute_monotonic_clock/1,
          propagate_update/8,
+         heartbeat/3,
          readrepair/6,
          list_keys/4,
          fold/3,
@@ -86,6 +87,7 @@
 -include_lib("riak_kv_index.hrl").
 -include_lib("riak_kv_map_phase.hrl").
 -include_lib("riak_core_pb.hrl").
+-include_lib("riak_kv_causal.hrl").
 -include("riak_kv_types.hrl").
 
 -ifdef(TEST).
@@ -133,6 +135,7 @@
                 max_ts :: integer(),
                 heartbeat_alarm :: {pid(), reference()},
                 monotonic_clock_alarm :: {pid(), reference()},
+                monotonic_clocks :: dict(),
                 latest_ts_given :: integer(),
                 pending_update :: boolean(),
                 md_cache_size :: pos_integer() }).
@@ -313,6 +316,12 @@ compute_monotonic_clock(IndexNode) ->
                                    {undefined, undefined, self()},
                                    riak_kv_vnode_master).
 
+heartbeat(Preflist, Clock, Partition) ->
+    riak_core_vnode_master:command(Preflist,
+                                   {heartbeat, Clock, Partition},
+                                   {fsm, undefined, self()},
+                                   riak_kv_vnode_master).
+
 %% Do a put without sending any replies
 readrepair(Preflist, BKey, Obj, ReqId, StartTime, Options) ->
     put(Preflist, BKey, Obj, ReqId, StartTime, [rr | Options], ignore).
@@ -451,6 +460,28 @@ init([Index]) ->
                 lager:debug("No metadata cache size defined, not starting"),
                 undefined
         end,
+    %%This creates the monotonic clocks. One vector per Preflist.
+    {ok, Ring} = riak_core_ring_manager:get_my_ring(),
+    GrossPreflists = riak_core_ring:all_preflists(Ring, ?FIXED_N_VAL),
+    Preflists = lists:foldl(fun(X, Filtered) -> 
+                                    case preflist_member(Index, X) of 
+                                        true ->
+                                            lists:append(Filtered,[X]);
+                                        false ->
+                                            Filtered
+                                    end
+                            end, [], GrossPreflists),
+    MonotonicClocks = lists:foldl(fun(X, Clocks) ->
+                                        lists:foldl(fun(E, Acc) ->
+                                                        {Partition, _} = E,
+                                                        case Index==Partition of
+                                                        true ->
+                                                            Acc;
+                                                        false ->
+                                                            dict:store(Partition, 0, Acc)
+                                                        end
+                                                    end, Clocks, X)
+                                    end, dict:new(), Preflists),
     case catch Mod:start(Index, Configuration) of
         {ok, ModState} ->
             %% Get the backend capabilities
@@ -468,6 +499,7 @@ init([Index]) ->
                            max_ts=MaxTS,
                            heartbeat_alarm=HeartbeatAlarm,
                            monotonic_clock_alarm=MonotonicAlarm,
+                           monotonic_clocks=MonotonicClocks,
                            md_cache_size=MDCacheSize},
             try_set_vnode_lock_limit(Index),
             case AsyncFolding of
@@ -689,6 +721,10 @@ handle_command(send_heartbeat, _Sender, State) ->
 
 handle_command(compute_monotonic_clock, _Sender, State) ->
     lager:info("Computing monotonic clocks"),
+    {noreply, State};
+
+handle_command({heartbeat, Clock, Partition}, Sender, State) ->
+    lager:info("Heartbeat from ~p/~p with clock ~p received\n", [Sender, Partition, Clock]),
     {noreply, State};
 
 handle_command({fold_indexes, FoldIndexFun, Acc}, Sender, State=#state{mod=Mod, modstate=ModState}) ->
@@ -2360,6 +2396,21 @@ new_md_cache(VId) ->
 
 now_milisec({MegaSecs, Secs, MicroSecs}) ->
     (MegaSecs * 1000000 + Secs) * 1000000 + MicroSecs.
+
+%% @doc preflist_member: Returns true if the Partition identifier is part of the Preflist
+%%      Input:  Partition: The partidion identifier to check
+%%              Preflist: A list of pairs {Partition, Node}
+%%      Return: true | false
+-spec preflist_member(Partition::non_neg_integer(), Preflist::[{Index::integer(), Node::term()}]) -> true | false.
+preflist_member(_Partition,[]) -> false;
+preflist_member(Partition,[Next|Rest]) ->
+    {PartitionB, _} = Next,
+    case PartitionB==Partition of
+        true ->
+            true;
+        false ->
+            preflist_member(Partition, Rest)
+    end.
 
 -ifdef(TEST).
 
