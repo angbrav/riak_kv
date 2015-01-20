@@ -479,7 +479,7 @@ init([Index]) ->
                                                                                 true ->
                                                                                     {Dict, List};
                                                                                 false ->
-                                                                                    {dict:store(Partition, 0, Dict), List ++ [Partition]}
+                                                                                    {dict:store(Partition, 0, Dict), List ++ [E]}
                                                                                 end
                                                                               end, {Clocks0, []}, X),
                                                         {Clocks, dict:store(Key, 0, MyClocks0)}
@@ -718,8 +718,10 @@ handle_command({propagate_update, Preflist, BKey, Obj, ReqId, StartTime, Options
     riak_kv_vnode:put(Preflist, BKey, Obj, ReqId, StartTime, Options, Sender),
     {noreply, State#state{pending_update=false}};
 
-handle_command(send_heartbeat, _Sender, State) ->
-    
+handle_command(send_heartbeat, _Sender, State=#state{my_monotonic_clocks=MyMonotonicClocks, idx=Index}) ->
+    lists:foreach(fun({Preflist, Counter}) ->
+                    riak_kv_vnode:heartbeat(Preflist, Counter, Index)
+                  end, dict:to_list(MyMonotonicClocks)), 
     {noreply, State};
 
 handle_command(compute_monotonic_clock, _Sender, State) ->
@@ -728,7 +730,6 @@ handle_command(compute_monotonic_clock, _Sender, State) ->
 
 handle_command({heartbeat, Clock, Partition}, Sender, State=#state{monotonic_clocks=Clocks0}) ->
     Clocks = dict:store(Partition, Clock, Clocks0),
-    lager:info("Heartbeat from ~p/~p with clock ~p received\n", [Sender, Partition, Clock]),
     {noreply, State#state{monotonic_clocks=Clocks}};
 
 handle_command({fold_indexes, FoldIndexFun, Acc}, Sender, State=#state{mod=Mod, modstate=ModState}) ->
