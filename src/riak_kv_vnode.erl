@@ -136,6 +136,7 @@
                 heartbeat_alarm :: {pid(), reference()},
                 monotonic_clock_alarm :: {pid(), reference()},
                 monotonic_clocks :: dict(),
+                my_monotonic_clocks :: dict(),
                 latest_ts_given :: integer(),
                 pending_update :: boolean(),
                 md_cache_size :: pos_integer() }).
@@ -471,17 +472,19 @@ init([Index]) ->
                                             Filtered
                                     end
                             end, [], GrossPreflists),
-    MonotonicClocks = lists:foldl(fun(X, Clocks) ->
-                                        lists:foldl(fun(E, Acc) ->
-                                                        {Partition, _} = E,
-                                                        case Index==Partition of
-                                                        true ->
-                                                            Acc;
-                                                        false ->
-                                                            dict:store(Partition, 0, Acc)
-                                                        end
-                                                    end, Clocks, X)
-                                    end, dict:new(), Preflists),
+    {MonotonicClocks, MyMonotonicClocks} = lists:foldl(fun(X, {Clocks0, MyClocks0}) ->
+                                                        {Clocks, Key} = lists:foldl(fun(E, {Dict, List}) ->
+                                                                                {Partition, _} = E,
+                                                                                case Partition==Index of
+                                                                                true ->
+                                                                                    {Dict, List};
+                                                                                false ->
+                                                                                    {dict:store(Partition, 0, Dict), List ++ [Partition]}
+                                                                                end
+                                                                              end, {Clocks0, []}, X),
+                                                        {Clocks, dict:store(Key, 0, MyClocks0)}
+                                                       end, {dict:new(), dict:new()}, Preflists),
+    lager:info("My partition is: ~p, and MyMonotonicClocks are ~p", [Index, dict:to_list(MyMonotonicClocks)]),
     case catch Mod:start(Index, Configuration) of
         {ok, ModState} ->
             %% Get the backend capabilities
@@ -500,6 +503,7 @@ init([Index]) ->
                            heartbeat_alarm=HeartbeatAlarm,
                            monotonic_clock_alarm=MonotonicAlarm,
                            monotonic_clocks=MonotonicClocks,
+                           my_monotonic_clocks=MyMonotonicClocks,
                            md_cache_size=MDCacheSize},
             try_set_vnode_lock_limit(Index),
             case AsyncFolding of
@@ -522,7 +526,6 @@ init([Index]) ->
             riak:stop("backend module failed to start."),
             {error, Reason1}
     end.
-
 
 handle_overload_command(?KV_PUT_REQ{}, Sender, Idx) ->
     riak_core_vnode:reply(Sender, {fail, Idx, overload});
@@ -707,7 +710,7 @@ handle_command({refresh_index_data, BKey, OldIdxData}, Sender,
     end;
 
 handle_command({get_op_ts, CausalClock}, _Sender, State=#state{max_ts=MaxTS}) ->
-    NextTS=max(now_milisec(erlang:now()), max(MaxTS + 1, CausalClock + 1)),
+    NextTS = max(now_milisec(erlang:now()), max(MaxTS + 1, CausalClock + 1)),
     LatestTSGiven=NextTS, 
     {reply, {ok, NextTS}, State#state{max_ts=NextTS, latest_ts_given=LatestTSGiven, pending_update=true}};
 
@@ -716,16 +719,17 @@ handle_command({propagate_update, Preflist, BKey, Obj, ReqId, StartTime, Options
     {noreply, State#state{pending_update=false}};
 
 handle_command(send_heartbeat, _Sender, State) ->
-    lager:info("Sending heartbeats"),
+    
     {noreply, State};
 
 handle_command(compute_monotonic_clock, _Sender, State) ->
     lager:info("Computing monotonic clocks"),
     {noreply, State};
 
-handle_command({heartbeat, Clock, Partition}, Sender, State) ->
+handle_command({heartbeat, Clock, Partition}, Sender, State=#state{monotonic_clocks=Clocks0}) ->
+    Clocks = dict:store(Partition, Clock, Clocks0),
     lager:info("Heartbeat from ~p/~p with clock ~p received\n", [Sender, Partition, Clock]),
-    {noreply, State};
+    {noreply, State#state{monotonic_clocks=Clocks}};
 
 handle_command({fold_indexes, FoldIndexFun, Acc}, Sender, State=#state{mod=Mod, modstate=ModState}) ->
     {ok, Caps} = Mod:capabilities(ModState),
