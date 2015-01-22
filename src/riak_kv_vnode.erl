@@ -38,7 +38,7 @@
          send_heartbeat/1,
          compute_monotonic_clock/1,
          propagate_update/8,
-         heartbeat/3,
+         heartbeat/4,
          readrepair/6,
          list_keys/4,
          fold/3,
@@ -135,8 +135,9 @@
                 max_ts :: integer(),
                 heartbeat_alarm :: {pid(), reference()},
                 monotonic_clock_alarm :: {pid(), reference()},
+                replication_groups :: dict(),
                 monotonic_clocks :: dict(),
-                my_monotonic_clocks :: dict(),
+                pending_puts :: [#riak_kv_pending_put{}],
                 latest_ts_given :: integer(),
                 pending_update :: boolean(),
                 md_cache_size :: pos_integer() }).
@@ -317,9 +318,9 @@ compute_monotonic_clock(IndexNode) ->
                                    {undefined, undefined, self()},
                                    riak_kv_vnode_master).
 
-heartbeat(Preflist, Clock, Partition) ->
+heartbeat(Preflist, Preflist2, Partition, Clock) ->
     riak_core_vnode_master:command(Preflist,
-                                   {heartbeat, Clock, Partition},
+                                   {heartbeat, Preflist2, Partition, Clock},
                                    {fsm, undefined, self()},
                                    riak_kv_vnode_master).
 
@@ -472,19 +473,14 @@ init([Index]) ->
                                             Filtered
                                     end
                             end, [], GrossPreflists),
-    {MonotonicClocks, MyMonotonicClocks} = lists:foldl(fun(X, {Clocks0, MyClocks0}) ->
-                                                        {Clocks, Key} = lists:foldl(fun(E, {Dict, List}) ->
-                                                                                {Partition, _} = E,
-                                                                                case Partition==Index of
-                                                                                true ->
-                                                                                    {Dict, List};
-                                                                                false ->
-                                                                                    {dict:store(Partition, 0, Dict), List ++ [E]}
-                                                                                end
-                                                                              end, {Clocks0, []}, X),
-                                                        {Clocks, dict:store(Key, 0, MyClocks0)}
-                                                       end, {dict:new(), dict:new()}, Preflists),
-    lager:info("My partition is: ~p, and MyMonotonicClocks are ~p", [Index, dict:to_list(MyMonotonicClocks)]),
+    {ReplicationGroups, MonotonicClocks, PendingPuts} = 
+        lists:foldl(fun(X, {Clocks0, Monotonic0, Pending0}) ->
+                        {Clocks, Key} = lists:foldl(fun(E, {Dict, List}) ->
+                                                        {Partition, _} = E,
+                                                        {dict:store(Partition, 0, Dict), List ++ [E]}
+                                                    end, {dict:new(), []}, X),
+                        {dict:store(Key, Clocks, Clocks0), dict:store(Key, 0, Monotonic0), dict:store(Key, [], Pending0)}
+                    end, {dict:new(), dict:new(), dict:new()}, Preflists),
     case catch Mod:start(Index, Configuration) of
         {ok, ModState} ->
             %% Get the backend capabilities
@@ -502,8 +498,9 @@ init([Index]) ->
                            max_ts=MaxTS,
                            heartbeat_alarm=HeartbeatAlarm,
                            monotonic_clock_alarm=MonotonicAlarm,
-                           monotonic_clocks=MonotonicClocks,
-                           my_monotonic_clocks=MyMonotonicClocks,
+                           replication_groups=ReplicationGroups,
+                           monotonic_clocks= MonotonicClocks,
+                           pending_puts=PendingPuts,
                            md_cache_size=MDCacheSize},
             try_set_vnode_lock_limit(Index),
             case AsyncFolding of
@@ -718,19 +715,66 @@ handle_command({propagate_update, Preflist, BKey, Obj, ReqId, StartTime, Options
     riak_kv_vnode:put(Preflist, BKey, Obj, ReqId, StartTime, Options, Sender),
     {noreply, State#state{pending_update=false}};
 
-handle_command(send_heartbeat, _Sender, State=#state{my_monotonic_clocks=MyMonotonicClocks, idx=Index}) ->
-    lists:foreach(fun({Preflist, Counter}) ->
-                    riak_kv_vnode:heartbeat(Preflist, Counter, Index)
-                  end, dict:to_list(MyMonotonicClocks)), 
+handle_command(send_heartbeat, _Sender, State=#state{replication_groups=ReplicationGroups, idx=Index}) ->
+    lists:foreach(fun({Preflist, Clocks}) ->
+                    Counter = dict:fetch(Index, Clocks),
+                    Preflist2 = lists:foldl(fun(E={Partition, _Node}, Filtered) ->
+                                                case Partition of
+                                                Index ->
+                                                    Filtered;
+                                                _ ->
+                                                    Filtered ++ [E]
+                                                end
+                                            end, [], Preflist),
+                    riak_kv_vnode:heartbeat(Preflist2, Preflist, Index, Counter)
+                  end, dict:to_list(ReplicationGroups)), 
     {noreply, State};
 
-handle_command(compute_monotonic_clock, _Sender, State) ->
-    lager:info("Computing monotonic clocks"),
-    {noreply, State};
+handle_command(compute_monotonic_clock, _Sender, State=#state{pending_puts=PendingPuts, max_ts=MaxTS, idx=Index, replication_groups=ReplicationGroups0, monotonic_clocks=MonotonicClocks0}) ->
+    ComputeIndexClock = fun({Preflist, Pending}, Acc0) ->
+                            case Pending of
+                            [] ->
+                                Clock = max(now_milisec(erlang:now()), MaxTS),
+                                update_clock(Preflist, Index, Clock, Acc0);
+                            [Operation|_Rest] ->
+                                TimeStamp = Operation#riak_kv_pending_put.time_stamp,
+                                Clock = TimeStamp - 1,
+                                update_clock(Preflist, Index, Clock, Acc0)
+                            end
+                        end,
+    ReplicationGroups = lists:foldl(ComputeIndexClock, ReplicationGroups0, dict:to_list(PendingPuts)),
+    ComputeMinimums = fun({Preflist, Clocks}, Acc) ->
+                        Min = lists:foldl(fun({_Partition, Clock}, Minimum) ->
+                                        case Minimum of
+                                        infinity ->
+                                            Clock;
+                                        _ ->
+                                            case Minimum > Clock of
+                                            true ->
+                                                Clock;
+                                            false ->
+                                                Minimum
+                                            end
+                                        end
+                                    end, infinity, dict:to_list(Clocks)),
+                        lager:info("Minimum: ~p", [Min]),
+                        dict:store(Preflist, Min, Acc)
+                      end,
+    MinimumsDict = lists:foldl(ComputeMinimums, dict:new(), dict:to_list(ReplicationGroups)),
+    UpdateMonotonicClock = fun({Preflist, Minimum}, Acc) ->
+                                case Minimum > dict:fetch(Preflist, Acc) of
+                                true ->
+                                    dict:store(Preflist, Minimum, Acc);
+                                false ->
+                                    Acc
+                                end
+                           end,
+    MonotonicClocks = lists:foldl(UpdateMonotonicClock, MonotonicClocks0, dict:to_list(MinimumsDict)),
+    {noreply, State#state{replication_groups=ReplicationGroups, monotonic_clocks=MonotonicClocks}};
 
-handle_command({heartbeat, Clock, Partition}, Sender, State=#state{monotonic_clocks=Clocks0}) ->
-    Clocks = dict:store(Partition, Clock, Clocks0),
-    {noreply, State#state{monotonic_clocks=Clocks}};
+handle_command({heartbeat, Preflist, Partition, Clock}, _Sender, State=#state{replication_groups=ReplicationGroups0}) ->
+    ReplicationGroups = update_clock(Preflist, Partition, Clock, ReplicationGroups0),
+    {noreply, State#state{replication_groups=ReplicationGroups}};
 
 handle_command({fold_indexes, FoldIndexFun, Acc}, Sender, State=#state{mod=Mod, modstate=ModState}) ->
     {ok, Caps} = Mod:capabilities(ModState),
@@ -2416,6 +2460,11 @@ preflist_member(Partition,[Next|Rest]) ->
         false ->
             preflist_member(Partition, Rest)
     end.
+
+update_clock(Preflist, Partition, Clock, ReplicationGroups) ->
+    Clocks0 = dict:fetch(Preflist, ReplicationGroups),
+    Clocks = dict:store(Partition, Clock, Clocks0),
+    dict:store(Preflist, Clocks, ReplicationGroups).
 
 -ifdef(TEST).
 
