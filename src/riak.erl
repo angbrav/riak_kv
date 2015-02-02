@@ -25,6 +25,9 @@
 -export([get_app_env/0, get_app_env/1,get_app_env/2]).
 -export([client_connect/1,client_connect/2,
          client_test/1,
+         client_write_test/2,
+         client_read_test/3,
+         client_new_object/3,
          local_client/0,local_client/1,
          join/1]).
 -export([code_hash/0]).
@@ -129,6 +132,76 @@ vnode_vclocks(Node) ->
             Result
     end.
 
+client_new_object(Node, Bucket, Key) ->
+    case net_adm:ping(Node) of
+    pong ->
+        case client_connect(Node) of
+            {ok, Client} ->
+                Object = riak_object:new(Bucket, Key, undefined),
+                case Client:put(Object, 1) of
+                    ok ->
+                        ok;
+                    Error ->
+                        io:format("Failed to write test value\n: ~p", [Error]),
+                        error
+                    end;
+            Error ->
+                io:format("Error creating client connection to ~s: ~p\n",[Node, Error]),
+                error
+            end;
+    pang ->
+        io:format("Node ~p is not reachable from ~p.\n", [Node, node()]),
+        error
+    end.
+    
+
+client_write_test(Node, Object) ->
+    case net_adm:ping(Node) of
+    pong ->
+        case client_connect(Node) of
+            {ok, Client} ->
+                case Client:put(Object, 1) of
+                    ok ->
+                        io:format("Success\n",[]),
+                        ok;
+                    Error ->
+                        io:format("Failed to write test value\n: ~p", [Error]),
+                        error
+                    end;
+            Error ->
+                io:format("Error creating client connection to ~s: ~p\n",[Node, Error]),
+                error
+            end;
+    pang ->
+        io:format("Node ~p is not reachable from ~p.\n", [Node, node()]),
+        error
+    end.
+                        
+client_read_test(Node, Bucket, Key) ->
+    case net_adm:ping(Node) of
+    pong ->
+        case client_connect(Node) of
+            {ok, Client} ->
+                case Client:get(Bucket, Key, 1) of
+                    {ok, Object} ->
+                        io:format("Success\n",[]),
+                        {ok, Object};
+                    {error, notfound} ->
+                        io:format("I have to create the object first\n", []),
+                        notfound;
+                    _Error ->
+                        io:format("Failed to read\n"),
+                        error
+                end;
+            Error ->
+                io:format("Error creating client connection to ~s: ~p\n",[Node, Error]),
+                error
+            end;
+    pang ->
+        io:format("Node ~p is not reachable from ~p.\n", [Node, node()]),
+        error
+    end.
+                        
 %%
 %% @doc Validate that a specified node is accessible and functional.
 %%
