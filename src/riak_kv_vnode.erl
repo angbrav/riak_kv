@@ -28,6 +28,7 @@
          start_vnodes/1,
          get/3,
          get/4,
+         get/5,
          del/3,
          put/6,
          put/8,
@@ -213,6 +214,12 @@ get(Preflist, BKey, ReqId) ->
     %% Assuming this function is called from a FSM process
     %% so self() == FSM pid
     get(Preflist, BKey, ReqId, {fsm, undefined, self()}).
+
+
+get(Preflist, BKey, ReqId, TimeStamp) when is_integer(TimeStamp)->
+    %% Assuming this function is called from a FSM process
+    %% so self() == FSM pid
+    get(Preflist, BKey, ReqId, {fsm, undefined, self()}, TimeStamp);
 
 get(Preflist, BKey, ReqId, Sender) ->
     get(Preflist, BKey, ReqId, Sender, 0).
@@ -574,38 +581,41 @@ handle_command({?KV_PUT_REQ_CAUSAL{time_stamp=TimeStamp0,
         TimeStamp=TimeStamp0
     end,
     StartTS = os:timestamp(),
+    %% TODO: Remove this message
     riak_core_vnode:reply(Sender, {{w, Idx, ReqId}, TimeStamp}),
     Preflist = get_primary_preflist(BKey, ?FIXED_N_VAL),
     try
-        case TimeStamp > (dict:fetch(Preflist, MonotonicClocks) + 1) of
+        Clock = dict:fetch(Preflist, MonotonicClocks),
+        case TimeStamp > (Clock + 1) of
         true -> 
             Puts0 = dict:fetch(Preflist, PendingPuts0),
             Pending=?KV_PUT_PENDING{bkey=BKey, object=Object, req_id=ReqId, start_time=StartTime, options=Options, sender=Sender},
-            Puts = dict:append(TimeStamp, Pending, Puts0),
+            Puts = orddict:append(TimeStamp, Pending, Puts0),
             PendingPuts = dict:store(Preflist, Puts, PendingPuts0),
-            {noreply, State#state{pending_gets=PendingPuts}};
+            riak_core_vnode:reply(Sender, {{dw, Idx, ReqId}, TimeStamp}),
+            {noreply, State#state{pending_puts=PendingPuts}};
         false ->
-            UpdState1 = do_put(Sender, BKey,  Object, ReqId, StartTime, Options, State, TimeStamp),
+            UpdState1 = do_put(Sender, BKey,  Object, ReqId, StartTime, Options, State, TimeStamp, true),
             update_vnode_stats(vnode_put, Idx, StartTS),
             {noreply, UpdState1}
         end
     catch Error:Reason ->
-        lager:error("No monotonic clocks when put for preflist: ~p.\nThe error given is: ~p and the resaon is ~p",[Preflist, Error, Reason]),
+        lager:error("No monotonic clocks when put for preflist: ~p.\nThe given error is: ~p and the resaon is ~p",[Preflist, Error, Reason]),
         UpdState = do_put(Sender, BKey,  Object, ReqId, StartTime, Options, State),
         update_vnode_stats(vnode_put, Idx, StartTS),
         {noreply, UpdState}
     end;
 
 handle_command(?KV_GET_REQ_CAUSAL{time_stamp=TimeStamp, bkey=BKey,req_id=ReqId},Sender,State=#state{monotonic_clocks=MonotonicClocks, pending_gets=PendingGets0}) ->
-    lager:info("BKey is ~p", [BKey]),
     Preflist = get_primary_preflist(BKey, ?FIXED_N_VAL),
     try
-        case TimeStamp > dict:fetch(Preflist, MonotonicClocks) of
+        Clock = dict:fetch(Preflist, MonotonicClocks), 
+        case TimeStamp > Clock of
         true -> 
             Gets0 = dict:fetch(Preflist, PendingGets0),
             Pending=?KV_GET_PENDING{bkey=BKey, req_id=ReqId, sender=Sender},
             Gets = dict:append(TimeStamp, Pending, Gets0),
-            PendingGets = dict:store(Preflist, Gets, PendingGets0),
+            PendingGets = orddict:store(Preflist, Gets, PendingGets0),
             {noreply, State#state{pending_gets=PendingGets}};
         false ->
             do_get(Sender, BKey, ReqId, State)
@@ -759,9 +769,9 @@ handle_command({refresh_index_data, BKey, OldIdxData}, Sender,
             {reply, {error, {indexes_not_supported, Mod}}, State}
     end;
 
-handle_command({propagate_update, Preflist, BKey, Obj, ReqId, StartTime, Options, TimeStamp}, Sender, State) ->
-    riak_kv_vnode:put(Preflist, BKey, Obj, ReqId, StartTime, Options, Sender, TimeStamp),
-    {noreply, State};
+handle_command({propagate_update, Preflist, BKey, Obj, ReqId, StartTime, Options, TimeStamp}, _Sender={server, undefined, {Pid, _Ref}}, State) ->
+    riak_kv_vnode:put(Preflist, BKey, Obj, ReqId, StartTime, Options, {fsm, undefined, Pid}, TimeStamp),
+    {reply, ok, State};
 
 handle_command(send_heartbeat, _Sender, State=#state{replication_groups=ReplicationGroups, idx=Index}) ->
     lists:foreach(fun({Preflist, Clocks}) ->
@@ -809,7 +819,7 @@ handle_command(compute_monotonic_clock, _Sender, State=#state{max_ts=MaxTS,
                                             end
                                         end
                                     end, infinity, dict:to_list(Clocks)),
-                        lager:info("Minimum: ~p", [Min]),
+                        %lager:info("Minimum: ~p", [Min]),
                         dict:store(Preflist, Min, Acc)
                       end,
     MinimumsDict = lists:foldl(ComputeMinimums, dict:new(), dict:to_list(ReplicationGroups)),
@@ -1392,9 +1402,9 @@ raw_put({Idx, Node}, Key, Obj) ->
 %% @private
 %% upon receipt of a client-initiated put
 do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, StartTime, Options, State) ->
-    do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, StartTime, Options, State, no_clock).
+    do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, StartTime, Options, State, no_clock, true).
 
-do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, StartTime, Options, State, TimeStamp) ->
+do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, StartTime, Options, State, TimeStamp, ReplyBack) ->
     case proplists:get_value(bucket_props, Options) of
         undefined ->
             BProps = riak_core_bucket:get_bucket(Bucket);
@@ -1421,8 +1431,12 @@ do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, StartTime, Options, State, TimeS
                        crdt_op = CRDTOp},
     {PrepPutRes, UpdPutArgs} = prepare_put(State, PutArgs),
     {Reply, UpdState} = perform_put(PrepPutRes, State, UpdPutArgs),
-    riak_core_vnode:reply(Sender, {Reply, TimeStamp}),
-
+    case ReplyBack of
+    true ->
+        riak_core_vnode:reply(Sender, {Reply, TimeStamp});
+    _ ->
+        undefined
+    end,
     update_index_write_stats(UpdPutArgs#putargs.is_index, UpdPutArgs#putargs.index_specs),
     UpdState.
 
@@ -2539,11 +2553,11 @@ get_primary_preflist(BKey, N) ->
 handle_pending_puts([], _Minimum, State) ->
     {[], State};
 
-handle_pending_puts(Puts=[{TimeStamp, Operations}, Rest], Minimum, State0) ->
+handle_pending_puts(Puts=[{TimeStamp, Operations}|Rest], Minimum, State0) ->
     case TimeStamp =< (Minimum + 1) of
     true ->
         State = lists:foldl(fun(_Operation=?KV_PUT_PENDING{bkey=BKey, object=Object, req_id=ReqId, start_time=StartTime, options=Options, sender=Sender}, Acc)->
-                                do_put(Sender, BKey, Object, ReqId, StartTime, Options, Acc)
+                                do_put(Sender, BKey, Object, ReqId, StartTime, Options, Acc, no_clock, false)
                             end, State0, Operations),
         handle_pending_puts(Rest, Minimum, State);
     false ->
@@ -2553,12 +2567,14 @@ handle_pending_puts(Puts=[{TimeStamp, Operations}, Rest], Minimum, State0) ->
 handle_pending_gets([], _Minimum, State) ->
     {[], State};
 
-handle_pending_gets(Gets=[{TimeStamp, Operations}, Rest], Minimum, State0) ->
+handle_pending_gets(Gets=[{TimeStamp, Operations}|Rest], Minimum, State0) ->
     case TimeStamp =< Minimum of
     true ->
+        lager:info("Operations are ~p", [Operations]),
         State = lists:foldl(fun(_Operation=?KV_GET_PENDING{bkey=BKey, req_id=ReqId, sender=Sender}, Acc0)->
                                 {reply, {r, Retval, Idx, ReqID}, Acc} = do_get(Sender, BKey, ReqId, Acc0),
-                                riak_core_vnode:reply(Sender, {r, Retval, Idx, ReqID}),
+                                lager:info("Things to reply: {r, ~p, ~p, ~p}",[Retval, Idx, ReqID]),
+                                %riak_core_vnode:reply(Sender, {r, Retval, Idx, ReqID}),
                                 Acc
                             end, State0, Operations),
         handle_pending_gets(Rest, Minimum, State);

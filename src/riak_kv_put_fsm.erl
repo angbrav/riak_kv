@@ -423,9 +423,9 @@ validate(timeout, StateData0 = #state{from = {raw, ReqId, _Pid},
                                       trace = Trace,
                                       preflist2 = Preflist2}) ->
     Timeout = get_option(timeout, Options0, ?DEFAULT_TIMEOUT),
-    PW0 = get_option(pw, Options0, default),
-    W0 = get_option(w, Options0, default),
-    DW0 = get_option(dw, Options0, default),
+    _PW0 = get_option(pw, Options0, default),
+    _W0 = get_option(w, Options0, default),
+    _DW0 = get_option(dw, Options0, default),
 
     %PW = riak_kv_util:expand_rw_value(pw, PW0, BucketProps, N),
     %W = riak_kv_util:expand_rw_value(w, W0, BucketProps, N),
@@ -452,12 +452,12 @@ validate(timeout, StateData0 = #state{from = {raw, ReqId, _Pid},
     MinVnodes = lists:max([1, W, DW, PW]), % always need at least one vnode
 
     if
-        PW =:= error ->
-            process_reply({error, {pw_val_violation, PW0}}, StateData0);
-        W =:= error ->
-            process_reply({error, {w_val_violation, W0}}, StateData0);
-        DW =:= error ->
-            process_reply({error, {dw_val_violation, DW0}}, StateData0);
+        %PW =:= error ->
+        %    process_reply({error, {pw_val_violation, PW0}}, StateData0);
+        %W =:= error ->
+        %    process_reply({error, {w_val_violation, W0}}, StateData0);
+        %DW =:= error ->
+        %    process_reply({error, {dw_val_violation, DW0}}, StateData0);
         (W > N) or (DW > N) or (PW > N) ->
             process_reply({error, {n_val_violation, N}}, StateData0);
         PW > NumPrimaries ->
@@ -687,7 +687,11 @@ waiting_remote_vnode({Result, _TS}, StateData = #state{putcore = PutCore,
             process_reply(Reply, StateData#state{putcore = UpdPutCore2});
         false ->
             {next_state, waiting_remote_vnode, StateData#state{putcore = UpdPutCore1}}
-    end.
+    end;
+
+waiting_remote_vnode(Anything, StateData) ->
+    lager:error("I have received a weird message when waiting for remotes ~p",[Anything]),
+    {next_state, waiting_remote_vnode, StateData}.
 
 %% @private
 postcommit(timeout, StateData = #state{postcommit = [], trace = Trace}) ->
@@ -775,7 +779,8 @@ handle_info({ack, Node, now_executing}, StateName, StateData) ->
     late_put_fsm_coordinator_ack(Node),
     riak_kv_stat:update(late_put_fsm_coordinator_ack),
     {next_state, StateName, StateData};
-handle_info(_Info, _StateName, StateData) ->
+handle_info(Info, _StateName, StateData) ->
+    lager:error("Info badly sent ~p",[Info]),
     {stop,badmsg,StateData}.
 
 %% @private
