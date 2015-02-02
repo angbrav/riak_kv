@@ -78,7 +78,7 @@ new(Node, ClientId) ->
 %%      R-value for the nodes have responded with a value or error.
 %% @equiv get(Bucket, Key, R, default_timeout())
 get(Bucket, Key, {?MODULE, [_Node, _ClientId]}=THIS) ->
-    get(Bucket, Key, [], THIS).
+    get(Bucket, no_dependences, Key, [], THIS).
 
 normal_get(Bucket, Key, Options, {?MODULE, [Node, _ClientId]}) ->
     Me = self(),
@@ -130,25 +130,9 @@ maybe_update_consistent_stat(Node, Stat, Bucket, StartTS, Result) ->
             ok
     end.
 
-%% @spec get(riak_object:bucket(), riak_object:key(), options(), riak_client()) ->
-%%       {ok, riak_object:riak_object()} |
-%%       {error, notfound} |
-%%       {error, {deleted, vclock()}} |
-%%       {error, timeout} |
-%%       {error, {n_val_violation, N::integer()}} |
-%%       {error, {r_val_unsatisfied, R::integer(), Replies::integer()}} |
-%%       {error, Err :: term()}
-%% @doc Fetch the object at Bucket/Key.  Return a value as soon as R-value for the nodes
-%%      have responded with a value or error.
+
 get(Bucket, Key, Options, {?MODULE, [Node, _ClientId]}=THIS) when is_list(Options) ->
-    case consistent_object(Node, Bucket) of
-        true ->
-            consistent_get(Bucket, Key, Options, THIS);
-        false ->
-            normal_get(Bucket, Key, Options, THIS);
-        {error,_}=Err ->
-            Err
-    end;
+    get(Bucket, no_dependences, Key, Options, THIS);
 
 %% @spec get(riak_object:bucket(), riak_object:key(), R :: integer(), riak_client()) ->
 %%       {ok, riak_object:riak_object()} |
@@ -161,7 +145,27 @@ get(Bucket, Key, Options, {?MODULE, [Node, _ClientId]}=THIS) when is_list(Option
 %%      nodes have responded with a value or error.
 %% @equiv get(Bucket, Key, R, default_timeout())
 get(Bucket, Key, R, {?MODULE, [_Node, _ClientId]}=THIS) ->
-    get(Bucket, Key, [{r, R}], THIS).
+    get(Bucket, no_dependences, Key, [{r, R}], THIS).
+
+%% @spec get(riak_object:bucket(), riak_object:key(), options(), riak_client()) ->
+%%       {ok, riak_object:riak_object()} |
+%%       {error, notfound} |
+%%       {error, {deleted, vclock()}} |
+%%       {error, timeout} |
+%%       {error, {n_val_violation, N::integer()}} |
+%%       {error, {r_val_unsatisfied, R::integer(), Replies::integer()}} |
+%%       {error, Err :: term()}
+%% @doc Fetch the object at Bucket/Key.  Return a value as soon as R-value for the nodes
+%%      have responded with a value or error.
+get(Bucket, CausalClock, Key, Options, {?MODULE, [Node, _ClientId]}=THIS) when is_list(Options) ->
+    case consistent_object(Node, Bucket) of
+        true ->
+            consistent_get(Bucket, Key, Options, THIS);
+        false ->
+            normal_get(Bucket, Key, Options, THIS);
+        {error,_}=Err ->
+            Err
+    end;
 
 %% @spec get(riak_object:bucket(), riak_object:key(), R :: integer(),
 %%           TimeoutMillisecs :: integer(), riak_client()) ->
@@ -178,7 +182,7 @@ get(Bucket, Key, R, Timeout, {?MODULE, [_Node, _ClientId]}=THIS) when
                                   is_binary(Key),
                                   (is_atom(R) or is_integer(R)),
                                   is_integer(Timeout) ->
-    get(Bucket, Key, [{r, R}, {timeout, Timeout}], THIS).
+    get(Bucket, no_dependences, Key, [{r, R}, {timeout, Timeout}], THIS).
 
 
 %% @spec put(RObj :: riak_object:riak_object(), riak_client()) ->
@@ -263,6 +267,8 @@ consistent_put_type(RObj, Options) ->
     end.
 
 
+put(RObj, Options, {?MODULE, [Node, _ClientId]}=THIS) when is_list(Options) ->
+    put(RObj, no_dependences, Options, THIS);
 %% @spec put(RObj :: riak_object:riak_object(), W :: integer(), riak_client()) ->
 %%        ok |
 %%       {error, too_many_fails} |
