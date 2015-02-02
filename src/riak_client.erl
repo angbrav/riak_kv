@@ -78,17 +78,17 @@ new(Node, ClientId) ->
 %%      R-value for the nodes have responded with a value or error.
 %% @equiv get(Bucket, Key, R, default_timeout())
 get(Bucket, Key, {?MODULE, [_Node, _ClientId]}=THIS) ->
-    get(Bucket, no_dependences, Key, [], THIS).
+    get(Bucket, no_dependencies, Key, [], THIS).
 
-normal_get(Bucket, Key, Options, {?MODULE, [Node, _ClientId]}) ->
+normal_get(Bucket, CausalClock, Key, Options, {?MODULE, [Node, _ClientId]}) ->
     Me = self(),
     ReqId = mk_reqid(),
     case node() of
         Node ->
-            riak_kv_get_fsm:start_link({raw, ReqId, Me}, Bucket, Key, Options);
+            riak_kv_get_fsm:start_link({raw, ReqId, Me}, CausalClock, Bucket, Key, Options);
         _ ->
             proc_lib:spawn_link(Node, riak_kv_get_fsm, start_link,
-                                [{raw, ReqId, Me}, Bucket, Key, Options])
+                                [{raw, ReqId, Me}, CausalClock, Bucket, Key, Options])
     end,
     %% TODO: Investigate adding a monitor here and eliminating the timeout.
     Timeout = recv_timeout(Options),
@@ -131,8 +131,8 @@ maybe_update_consistent_stat(Node, Stat, Bucket, StartTS, Result) ->
     end.
 
 
-get(Bucket, Key, Options, {?MODULE, [Node, _ClientId]}=THIS) when is_list(Options) ->
-    get(Bucket, no_dependences, Key, Options, THIS);
+get(Bucket, Key, Options, {?MODULE, [_Node, _ClientId]}=THIS) when is_list(Options) ->
+    get(Bucket, no_dependencies, Key, Options, THIS);
 
 %% @spec get(riak_object:bucket(), riak_object:key(), R :: integer(), riak_client()) ->
 %%       {ok, riak_object:riak_object()} |
@@ -145,7 +145,7 @@ get(Bucket, Key, Options, {?MODULE, [Node, _ClientId]}=THIS) when is_list(Option
 %%      nodes have responded with a value or error.
 %% @equiv get(Bucket, Key, R, default_timeout())
 get(Bucket, Key, R, {?MODULE, [_Node, _ClientId]}=THIS) ->
-    get(Bucket, no_dependences, Key, [{r, R}], THIS).
+    get(Bucket, no_dependencies, Key, [{r, R}], THIS).
 
 %% @spec get(riak_object:bucket(), riak_object:key(), options(), riak_client()) ->
 %%       {ok, riak_object:riak_object()} |
@@ -162,7 +162,7 @@ get(Bucket, CausalClock, Key, Options, {?MODULE, [Node, _ClientId]}=THIS) when i
         true ->
             consistent_get(Bucket, Key, Options, THIS);
         false ->
-            normal_get(Bucket, Key, Options, THIS);
+            normal_get(Bucket, CausalClock, Key, Options, THIS);
         {error,_}=Err ->
             Err
     end;
@@ -182,7 +182,7 @@ get(Bucket, Key, R, Timeout, {?MODULE, [_Node, _ClientId]}=THIS) when
                                   is_binary(Key),
                                   (is_atom(R) or is_integer(R)),
                                   is_integer(Timeout) ->
-    get(Bucket, no_dependences, Key, [{r, R}, {timeout, Timeout}], THIS).
+    get(Bucket, no_dependencies, Key, [{r, R}, {timeout, Timeout}], THIS).
 
 
 %% @spec put(RObj :: riak_object:riak_object(), riak_client()) ->
@@ -267,8 +267,8 @@ consistent_put_type(RObj, Options) ->
     end.
 
 
-put(RObj, Options, {?MODULE, [Node, _ClientId]}=THIS) when is_list(Options) ->
-    put(RObj, no_dependences, Options, THIS);
+put(RObj, Options, {?MODULE, [_Node, _ClientId]}=THIS) when is_list(Options) ->
+    put(RObj, no_dependencies, Options, THIS);
 %% @spec put(RObj :: riak_object:riak_object(), W :: integer(), riak_client()) ->
 %%        ok |
 %%       {error, too_many_fails} |
