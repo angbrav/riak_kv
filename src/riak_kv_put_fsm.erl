@@ -310,7 +310,6 @@ prepare(timeout, StateData0 = #state{from = From, robj = RObj,
                                      bkey = BKey = {Bucket, _Key},
                                      options = Options,
                                      trace = Trace,
-                                     causal_clock = CausalClock,
                                      bad_coordinators = BadCoordinators}) ->
     {ok, DefaultProps} = application:get_env(riak_core, 
                                              default_bucket_props),
@@ -404,28 +403,15 @@ prepare(timeout, StateData0 = #state{from = From, robj = RObj,
                                 end,
                     %% This node is in the preference list, continue
                     StartTime = riak_core_util:moment(),
-                    lager:info("Causal clock: ~p\n", [CausalClock]),
-                    try 
-                        {ok, TimeStamp} = riak_kv_vnode:get_op_ts(CoordPLEntry, CausalClock, ?GET_OP_TS_TIMEOUT),
-                        lager:info("Operation time_stamp: ~p\n", [TimeStamp]),
-                        StateData = StateData0#state{n = N,
-                                                    bucket_props = Props,
-                                                    coord_pl_entry = CoordPLEntry,
-                                                    preflist2 = Preflist2,
-                                                    starttime = StartTime,
-                                                    op_ts = TimeStamp,
-                                                    tracked_bucket = StatTracked},
-                        ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [0], 
+                    StateData = StateData0#state{n = N,
+                                                 bucket_props = Props,
+                                                 coord_pl_entry = CoordPLEntry,
+                                                 preflist2 = Preflist2,
+                                                 starttime = StartTime,
+                                                 tracked_bucket = StatTracked},
+                    ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [0], 
                             ["prepare", CoordPlNode]),
-                        new_state_timeout(validate, StateData)
-                    catch
-                       _:Reason -> 
-                            ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-2],
-                                    ["prepare", dtrace_errstr(Reason)]),
-                            lager:error("Unable to get put_timestamp from vnode for ~p to ~p - ~p @ ~p\n",
-                                        [BKey, CoordPLEntry, Reason, erlang:get_stacktrace()]),
-                            process_reply({error, {coord_handoff_failed, Reason}}, StateData0)
-                    end
+                    new_state_timeout(validate, StateData)
             end
     end.
 
@@ -441,20 +427,24 @@ validate(timeout, StateData0 = #state{from = {raw, ReqId, _Pid},
     W0 = get_option(w, Options0, default),
     DW0 = get_option(dw, Options0, default),
 
-    PW = riak_kv_util:expand_rw_value(pw, PW0, BucketProps, N),
-    W = riak_kv_util:expand_rw_value(w, W0, BucketProps, N),
+    %PW = riak_kv_util:expand_rw_value(pw, PW0, BucketProps, N),
+    %W = riak_kv_util:expand_rw_value(w, W0, BucketProps, N),
 
     %% Expand the DW value, but also ensure that DW <= W
-    DW1 = riak_kv_util:expand_rw_value(dw, DW0, BucketProps, N),
+    %DW1 = riak_kv_util:expand_rw_value(dw, DW0, BucketProps, N),
     %% If no error occurred expanding DW also ensure that DW <= W
-    case DW1 of
-        error ->
-            DW = error;
-        _ ->
+    %case DW1 of
+    %    error ->
+    %        DW = error;
+    %    _ ->
             %% DW must always be 1 with node-based vclocks.
             %% The coord vnode is responsible for incrementing the vclock
-            DW = erlang:max(DW1, 1)
-    end,
+    %        DW = erlang:max(DW1, 1)
+    %end,
+
+    PW = ?FIXED_W_VAL,
+    W = ?FIXED_W_VAL,
+    DW = ?FIXED_W_VAL,
 
     IdxType = [{Part, Type} || {{Part, _Node}, Type} <- Preflist2],
     NumPrimaries = length([x || {_,primary} <- Preflist2]),
@@ -585,6 +575,7 @@ execute_local(StateData=#state{robj=RObj, req_id = ReqId,
                                coord_pl_entry = {_Index, Node} = CoordPLEntry,
                                vnode_options=VnodeOptions,
                                trace = Trace,
+                               causal_clock = CausalClock,
                                starttime = StartTime}) ->
     StateData1 = 
         case Trace of 
@@ -595,7 +586,7 @@ execute_local(StateData=#state{robj=RObj, req_id = ReqId,
                 StateData
         end,
     TRef = schedule_timeout(Timeout),
-    riak_kv_vnode:coord_put(CoordPLEntry, BKey, RObj, ReqId, StartTime, VnodeOptions),
+    riak_kv_vnode:coord_put(CoordPLEntry, BKey, RObj, ReqId, StartTime, VnodeOptions, CausalClock),
     StateData2 = StateData1#state{robj = RObj, tref = TRef},
     %% Must always wait for local vnode - it contains the object with updated vclock
     %% to use for the remotes. (Ignore optimization for N=1 case for now).
@@ -605,7 +596,7 @@ execute_local(StateData=#state{robj=RObj, req_id = ReqId,
 waiting_local_vnode(request_timeout, StateData=#state{trace = Trace}) ->
     ?DTRACE(Trace, ?C_PUT_FSM_WAITING_LOCAL_VNODE, [-1], []),
     process_reply({error,timeout}, StateData);
-waiting_local_vnode(Result, StateData = #state{putcore = PutCore,
+waiting_local_vnode({Result, TS}, StateData = #state{putcore = PutCore,
                                                trace = Trace}) ->
     UpdPutCore1 = riak_kv_put_core:add_result(Result, PutCore),
     case Result of
@@ -624,12 +615,12 @@ waiting_local_vnode(Result, StateData = #state{putcore = PutCore,
             %% object for the remote vnode
             ?DTRACE(Trace, ?C_PUT_FSM_WAITING_LOCAL_VNODE, [2],
                     [integer_to_list(Idx)]),
-            execute_remote(StateData#state{robj = PutObj, putcore = UpdPutCore1});
+            execute_remote(StateData#state{robj = PutObj, putcore = UpdPutCore1, op_ts=TS});
         {dw, Idx, _ReqId} ->
             %% Write succeeded without changes to vclock required and returnbody false
             ?DTRACE(Trace, ?C_PUT_FSM_WAITING_LOCAL_VNODE, [2],
                     [integer_to_list(Idx)]),
-            execute_remote(StateData#state{putcore = UpdPutCore1})
+            execute_remote(StateData#state{putcore = UpdPutCore1, op_ts=TS})
     end.
 
 %% @private
@@ -642,7 +633,8 @@ execute_remote(StateData=#state{robj=RObj, req_id = ReqId,
                                 vnode_options = VnodeOptions,
                                 putcore = PutCore,
                                 trace = Trace,
-                                starttime = StartTime}) ->
+                                starttime = StartTime,
+                                op_ts=TimeStamp}) ->
     Preflist = [IndexNode || {IndexNode, _Type} <- Preflist2,
                              IndexNode /= CoordPLEntry],
     StateData1 = 
@@ -657,7 +649,7 @@ execute_remote(StateData=#state{robj=RObj, req_id = ReqId,
         end,
     %riak_kv_vnode:put(Preflist, BKey, RObj, ReqId, StartTime, VnodeOptions),
     try
-        riak_kv_vnode:propagate_update(CoordPLEntry, Preflist, BKey, RObj, ReqId, StartTime, VnodeOptions, ?UPDATE_PROPAGATION_TIMEOUT),
+        riak_kv_vnode:propagate_update(CoordPLEntry, Preflist, BKey, RObj, ReqId, StartTime, VnodeOptions, TimeStamp, ?UPDATE_PROPAGATION_TIMEOUT),
         case riak_kv_put_core:enough(PutCore) of
             true ->
                 {Reply, UpdPutCore} = riak_kv_put_core:response(PutCore),
@@ -678,7 +670,7 @@ execute_remote(StateData=#state{robj=RObj, req_id = ReqId,
 waiting_remote_vnode(request_timeout, StateData=#state{trace = Trace}) ->
     ?DTRACE(Trace, ?C_PUT_FSM_WAITING_REMOTE_VNODE, [-1], []),
     process_reply({error,timeout}, StateData);
-waiting_remote_vnode(Result, StateData = #state{putcore = PutCore,
+waiting_remote_vnode({Result, _TS}, StateData = #state{putcore = PutCore,
                                                 trace = Trace}) ->
     case Trace of
         true ->
