@@ -30,14 +30,15 @@
          get/4,
          del/3,
          put/6,
+         put/8,
          local_get/2,
          local_put/2,
          local_put/3,
          coord_put/6,
-         get_op_ts/3,
+         coord_put/7,
          send_heartbeat/1,
          compute_monotonic_clock/1,
-         propagate_update/8,
+         propagate_update/9,
          heartbeat/4,
          readrepair/6,
          list_keys/4,
@@ -137,9 +138,9 @@
                 monotonic_clock_alarm :: {pid(), reference()},
                 replication_groups :: dict(),
                 monotonic_clocks :: dict(),
-                pending_puts :: [#riak_kv_pending_put{}],
+                pending_puts :: dict(),
+                pending_gets :: dict(),
                 latest_ts_given :: integer(),
-                pending_update :: boolean(),
                 md_cache_size :: pos_integer() }).
 
 -type index_op() :: add | remove.
@@ -214,8 +215,12 @@ get(Preflist, BKey, ReqId) ->
     get(Preflist, BKey, ReqId, {fsm, undefined, self()}).
 
 get(Preflist, BKey, ReqId, Sender) ->
-    Req = ?KV_GET_REQ{bkey=sanitize_bkey(BKey),
-                      req_id=ReqId},
+    get(Preflist, BKey, ReqId, Sender, 0).
+
+get(Preflist, BKey, ReqId, Sender, TimeStamp) ->
+    Req = ?KV_GET_REQ_CAUSAL{time_stamp=TimeStamp,
+                             bkey=sanitize_bkey(BKey),
+                             req_id=ReqId},
     riak_core_vnode_master:command(Preflist,
                                    Req,
                                    Sender,
@@ -232,15 +237,19 @@ del(Preflist, BKey, ReqId) ->
 put(Preflist, BKey, Obj, ReqId, StartTime, Options) when is_integer(StartTime) ->
     put(Preflist, BKey, Obj, ReqId, StartTime, Options, {fsm, undefined, self()}).
 
-put(Preflist, BKey, Obj, ReqId, StartTime, Options, Sender)
+put(Preflist, BKey, Obj, ReqId, StartTime, Options, Sender) ->
+    put(Preflist, BKey, Obj, ReqId, StartTime, Options, Sender, 0).
+
+put(Preflist, BKey, Obj, ReqId, StartTime, Options, Sender, TimeStamp)
   when is_integer(StartTime) ->
     riak_core_vnode_master:command(Preflist,
-                                   ?KV_PUT_REQ{
+                                   {?KV_PUT_REQ_CAUSAL{
+                                      time_stamp=TimeStamp,
                                       bkey = sanitize_bkey(BKey),
                                       object = Obj,
                                       req_id = ReqId,
                                       start_time = StartTime,
-                                      options = Options},
+                                      options = Options},false},
                                    Sender,
                                    riak_kv_vnode_master).
 
@@ -282,27 +291,29 @@ refresh_index_data(Partition, BKey, IdxData, TimeOut) ->
 coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options) when is_integer(StartTime) ->
     coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options, {fsm, undefined, self()}).
 
-coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options, Sender)
+coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options, CausalClock)
+  when is_integer(CausalClock) ->
+    coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options, {fsm, undefined, self()}, CausalClock);
+
+coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options, Sender) ->
+    coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options, Sender, 0).
+
+coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options, Sender, CausalClock)
   when is_integer(StartTime) ->
     riak_core_vnode_master:command(IndexNode,
-                                   ?KV_PUT_REQ{
+                                   {?KV_PUT_REQ_CAUSAL{
+                                      time_stamp = CausalClock,
                                       bkey = sanitize_bkey(BKey),
                                       object = Obj,
                                       req_id = ReqId,
                                       start_time = StartTime,
-                                      options = [coord | Options]},
+                                      options = [coord | Options]},true},
                                    Sender,
                                    riak_kv_vnode_master).
 
-get_op_ts(IndexNode, CausalClock, TimeOut) ->
+propagate_update(IndexNode, Preflist, BKey, Obj, ReqId, StartTime, Options, TimeStamp, TimeOut) ->
     riak_core_vnode_master:sync_command(IndexNode,
-                                        {get_op_ts, CausalClock},
-                                        riak_kv_vnode_master,
-                                        TimeOut).
-
-propagate_update(IndexNode, Preflist, BKey, Obj, ReqId, StartTime, Options, TimeOut) ->
-    riak_core_vnode_master:sync_command(IndexNode,
-                                        {propagate_update, Preflist, BKey, Obj, ReqId, StartTime, Options},
+                                        {propagate_update, Preflist, BKey, Obj, ReqId, StartTime, Options, TimeStamp},
                                         riak_kv_vnode_master,
                                         TimeOut).
 
@@ -473,14 +484,14 @@ init([Index]) ->
                                             Filtered
                                     end
                             end, [], GrossPreflists),
-    {ReplicationGroups, MonotonicClocks, PendingPuts} = 
-        lists:foldl(fun(X, {Clocks0, Monotonic0, Pending0}) ->
+    {ReplicationGroups, MonotonicClocks, PendingPuts, PendingGets} = 
+        lists:foldl(fun(X, {Clocks0, Monotonic0, PendingPuts0, PendingGets0}) ->
                         {Clocks, Key} = lists:foldl(fun(E, {Dict, List}) ->
                                                         {Partition, _} = E,
                                                         {dict:store(Partition, 0, Dict), List ++ [E]}
                                                     end, {dict:new(), []}, X),
-                        {dict:store(Key, Clocks, Clocks0), dict:store(Key, 0, Monotonic0), dict:store(Key, [], Pending0)}
-                    end, {dict:new(), dict:new(), dict:new()}, Preflists),
+                        {dict:store(Key, Clocks, Clocks0), dict:store(Key, 0, Monotonic0), dict:store(Key, orddict:new(), PendingPuts0), dict:store(Key, orddict:new(), PendingGets0)}
+                    end, {dict:new(), dict:new(), dict:new(), dict:new()}, Preflists),
     case catch Mod:start(Index, Configuration) of
         {ok, ModState} ->
             %% Get the backend capabilities
@@ -501,6 +512,7 @@ init([Index]) ->
                            replication_groups=ReplicationGroups,
                            monotonic_clocks= MonotonicClocks,
                            pending_puts=PendingPuts,
+                           pending_gets=PendingGets,
                            md_cache_size=MDCacheSize},
             try_set_vnode_lock_limit(Index),
             case AsyncFolding of
@@ -548,20 +560,61 @@ handle_overload_info({raw_forward_get, _, From}, _Idx) ->
 handle_overload_info(_, _) ->
     ok.
 
-handle_command(?KV_PUT_REQ{bkey=BKey,
+handle_command({?KV_PUT_REQ_CAUSAL{time_stamp=TimeStamp0,
+                           bkey=BKey,
                            object=Object,
                            req_id=ReqId,
                            start_time=StartTime,
-                           options=Options},
-               Sender, State=#state{idx=Idx}) ->
+                           options=Options}, Coord},
+               Sender, State=#state{idx=Idx, monotonic_clocks=MonotonicClocks, pending_puts=PendingPuts0, max_ts=MaxTS}) ->
+    case Coord of
+    true ->
+        TimeStamp = max(now_milisec(erlang:now()), max(MaxTS + 1, TimeStamp0 + 1));
+    false ->
+        TimeStamp=TimeStamp0
+    end,
     StartTS = os:timestamp(),
-    riak_core_vnode:reply(Sender, {w, Idx, ReqId}),
-    UpdState = do_put(Sender, BKey,  Object, ReqId, StartTime, Options, State),
-    update_vnode_stats(vnode_put, Idx, StartTS),
-    {noreply, UpdState};
+    riak_core_vnode:reply(Sender, {{w, Idx, ReqId}, TimeStamp}),
+    Preflist = get_primary_preflist(BKey, ?FIXED_N_VAL),
+    try
+        case TimeStamp > (dict:fetch(Preflist, MonotonicClocks) + 1) of
+        true -> 
+            Puts0 = dict:fetch(Preflist, PendingPuts0),
+            Pending=?KV_PUT_PENDING{bkey=BKey, object=Object, req_id=ReqId, start_time=StartTime, options=Options, sender=Sender},
+            Puts = dict:append(TimeStamp, Pending, Puts0),
+            PendingPuts = dict:store(Preflist, Puts, PendingPuts0),
+            {noreply, State#state{pending_gets=PendingPuts}};
+        false ->
+            UpdState1 = do_put(Sender, BKey,  Object, ReqId, StartTime, Options, State, TimeStamp),
+            update_vnode_stats(vnode_put, Idx, StartTS),
+            {noreply, UpdState1}
+        end
+    catch Error:Reason ->
+        lager:error("No monotonic clocks when put for preflist: ~p.\nThe error given is: ~p and the resaon is ~p",[Preflist, Error, Reason]),
+        UpdState = do_put(Sender, BKey,  Object, ReqId, StartTime, Options, State),
+        update_vnode_stats(vnode_put, Idx, StartTS),
+        {noreply, UpdState}
+    end;
 
-handle_command(?KV_GET_REQ{bkey=BKey,req_id=ReqId},Sender,State) ->
-    do_get(Sender, BKey, ReqId, State);
+handle_command(?KV_GET_REQ_CAUSAL{time_stamp=TimeStamp, bkey=BKey,req_id=ReqId},Sender,State=#state{monotonic_clocks=MonotonicClocks, pending_gets=PendingGets0}) ->
+    lager:info("BKey is ~p", [BKey]),
+    Preflist = get_primary_preflist(BKey, ?FIXED_N_VAL),
+    try
+        case TimeStamp > dict:fetch(Preflist, MonotonicClocks) of
+        true -> 
+            Gets0 = dict:fetch(Preflist, PendingGets0),
+            Pending=?KV_GET_PENDING{bkey=BKey, req_id=ReqId, sender=Sender},
+            Gets = dict:append(TimeStamp, Pending, Gets0),
+            PendingGets = dict:store(Preflist, Gets, PendingGets0),
+            {noreply, State#state{pending_gets=PendingGets}};
+        false ->
+            do_get(Sender, BKey, ReqId, State)
+        end
+    catch Error:Reason ->
+        lager:error("No monotonic clocks when get for preflist: ~p.\nThe error given is: ~p and the resaon is ~p",[Preflist, Error, Reason]),
+        do_get(Sender, BKey, ReqId, State)
+    end;
+            
 handle_command(#riak_kv_listkeys_req_v2{bucket=Input, req_id=ReqId, caller=Caller}, _Sender,
                State=#state{async_folding=AsyncFolding,
                             key_buf_size=BufferSize,
@@ -706,14 +759,9 @@ handle_command({refresh_index_data, BKey, OldIdxData}, Sender,
             {reply, {error, {indexes_not_supported, Mod}}, State}
     end;
 
-handle_command({get_op_ts, CausalClock}, _Sender, State=#state{max_ts=MaxTS}) ->
-    NextTS = max(now_milisec(erlang:now()), max(MaxTS + 1, CausalClock + 1)),
-    LatestTSGiven=NextTS, 
-    {reply, {ok, NextTS}, State#state{max_ts=NextTS, latest_ts_given=LatestTSGiven, pending_update=true}};
-
-handle_command({propagate_update, Preflist, BKey, Obj, ReqId, StartTime, Options}, Sender, State) ->
-    riak_kv_vnode:put(Preflist, BKey, Obj, ReqId, StartTime, Options, Sender),
-    {noreply, State#state{pending_update=false}};
+handle_command({propagate_update, Preflist, BKey, Obj, ReqId, StartTime, Options, TimeStamp}, Sender, State) ->
+    riak_kv_vnode:put(Preflist, BKey, Obj, ReqId, StartTime, Options, Sender, TimeStamp),
+    {noreply, State};
 
 handle_command(send_heartbeat, _Sender, State=#state{replication_groups=ReplicationGroups, idx=Index}) ->
     lists:foreach(fun({Preflist, Clocks}) ->
@@ -730,19 +778,23 @@ handle_command(send_heartbeat, _Sender, State=#state{replication_groups=Replicat
                   end, dict:to_list(ReplicationGroups)), 
     {noreply, State};
 
-handle_command(compute_monotonic_clock, _Sender, State=#state{pending_puts=PendingPuts, max_ts=MaxTS, idx=Index, replication_groups=ReplicationGroups0, monotonic_clocks=MonotonicClocks0}) ->
+handle_command(compute_monotonic_clock, _Sender, State=#state{max_ts=MaxTS,
+                                                              idx=Index,
+                                                              replication_groups=ReplicationGroups0,
+                                                              pending_puts=PendingPuts0,
+                                                              pending_gets=PendingGets0,
+                                                              monotonic_clocks=MonotonicClocks0}) ->
     ComputeIndexClock = fun({Preflist, Pending}, Acc0) ->
                             case Pending of
                             [] ->
                                 Clock = max(now_milisec(erlang:now()), MaxTS),
                                 update_clock(Preflist, Index, Clock, Acc0);
-                            [Operation|_Rest] ->
-                                TimeStamp = Operation#riak_kv_pending_put.time_stamp,
+                            [{TimeStamp, _Op}|_Rest] ->
                                 Clock = TimeStamp - 1,
                                 update_clock(Preflist, Index, Clock, Acc0)
                             end
                         end,
-    ReplicationGroups = lists:foldl(ComputeIndexClock, ReplicationGroups0, dict:to_list(PendingPuts)),
+    ReplicationGroups = lists:foldl(ComputeIndexClock, ReplicationGroups0, dict:to_list(PendingPuts0)),
     ComputeMinimums = fun({Preflist, Clocks}, Acc) ->
                         Min = lists:foldl(fun({_Partition, Clock}, Minimum) ->
                                         case Minimum of
@@ -761,16 +813,23 @@ handle_command(compute_monotonic_clock, _Sender, State=#state{pending_puts=Pendi
                         dict:store(Preflist, Min, Acc)
                       end,
     MinimumsDict = lists:foldl(ComputeMinimums, dict:new(), dict:to_list(ReplicationGroups)),
-    UpdateMonotonicClock = fun({Preflist, Minimum}, Acc) ->
-                                case Minimum > dict:fetch(Preflist, Acc) of
+    UpdateMonotonicClock = fun({Preflist, Minimum},{MClocks0, PPuts0, PGets0, State0}) ->
+                                case Minimum > dict:fetch(Preflist, MClocks0) of
                                 true ->
-                                    dict:store(Preflist, Minimum, Acc);
+                                    Puts0 = dict:fetch(Preflist, PPuts0),
+                                    {Puts, State} = handle_pending_puts(Puts0, Minimum, State0),    
+                                    PPuts = dict:store(Preflist, Puts, PPuts0),
+                                    Gets0 = dict:fetch(Preflist, PGets0),
+                                    {Gets, State2} = handle_pending_gets(Gets0, Minimum, State),    
+                                    PGets = dict:store(Preflist, Gets, PGets0),
+                                    MClocks = dict:store(Preflist, Minimum, MClocks0),
+                                    {MClocks, PPuts, PGets, State2};
                                 false ->
-                                    Acc
+                                    {MClocks0, PPuts0, PGets0, State0}
                                 end
                            end,
-    MonotonicClocks = lists:foldl(UpdateMonotonicClock, MonotonicClocks0, dict:to_list(MinimumsDict)),
-    {noreply, State#state{replication_groups=ReplicationGroups, monotonic_clocks=MonotonicClocks}};
+    {MonotonicClocks, PendingPuts, PendingGets, UpdatedState} = lists:foldl(UpdateMonotonicClock, {MonotonicClocks0, PendingPuts0, PendingGets0, State}, dict:to_list(MinimumsDict)),
+    {noreply, UpdatedState#state{replication_groups=ReplicationGroups, monotonic_clocks=MonotonicClocks, pending_puts=PendingPuts, pending_gets=PendingGets}};
 
 handle_command({heartbeat, Preflist, Partition, Clock}, _Sender, State=#state{replication_groups=ReplicationGroups0}) ->
     ReplicationGroups = update_clock(Preflist, Partition, Clock, ReplicationGroups0),
@@ -1333,6 +1392,9 @@ raw_put({Idx, Node}, Key, Obj) ->
 %% @private
 %% upon receipt of a client-initiated put
 do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, StartTime, Options, State) ->
+    do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, StartTime, Options, State, no_clock).
+
+do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, StartTime, Options, State, TimeStamp) ->
     case proplists:get_value(bucket_props, Options) of
         undefined ->
             BProps = riak_core_bucket:get_bucket(Bucket);
@@ -1359,7 +1421,7 @@ do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, StartTime, Options, State) ->
                        crdt_op = CRDTOp},
     {PrepPutRes, UpdPutArgs} = prepare_put(State, PutArgs),
     {Reply, UpdState} = perform_put(PrepPutRes, State, UpdPutArgs),
-    riak_core_vnode:reply(Sender, Reply),
+    riak_core_vnode:reply(Sender, {Reply, TimeStamp}),
 
     update_index_write_stats(UpdPutArgs#putargs.is_index, UpdPutArgs#putargs.index_specs),
     UpdState.
@@ -2465,6 +2527,44 @@ update_clock(Preflist, Partition, Clock, ReplicationGroups) ->
     Clocks0 = dict:fetch(Preflist, ReplicationGroups),
     Clocks = dict:store(Partition, Clock, Clocks0),
     dict:store(Preflist, Clocks, ReplicationGroups).
+
+-spec get_primary_preflist(binary(), non_neg_integer()) -> [{integer(), term()}].
+get_primary_preflist(BKey, N) ->
+    DocIdx = riak_core_util:chash_key(BKey),
+    {ok, CHBin} = riak_core_ring_manager:get_chash_bin(),
+    Itr = chashbin:iterator(DocIdx, CHBin),
+    {Primaries, _} = chashbin:itr_pop(N, Itr),
+    Primaries.
+
+handle_pending_puts([], _Minimum, State) ->
+    {[], State};
+
+handle_pending_puts(Puts=[{TimeStamp, Operations}, Rest], Minimum, State0) ->
+    case TimeStamp =< (Minimum + 1) of
+    true ->
+        State = lists:foldl(fun(_Operation=?KV_PUT_PENDING{bkey=BKey, object=Object, req_id=ReqId, start_time=StartTime, options=Options, sender=Sender}, Acc)->
+                                do_put(Sender, BKey, Object, ReqId, StartTime, Options, Acc)
+                            end, State0, Operations),
+        handle_pending_puts(Rest, Minimum, State);
+    false ->
+        {Puts, State0}
+    end.
+    
+handle_pending_gets([], _Minimum, State) ->
+    {[], State};
+
+handle_pending_gets(Gets=[{TimeStamp, Operations}, Rest], Minimum, State0) ->
+    case TimeStamp =< Minimum of
+    true ->
+        State = lists:foldl(fun(_Operation=?KV_GET_PENDING{bkey=BKey, req_id=ReqId, sender=Sender}, Acc0)->
+                                {reply, {r, Retval, Idx, ReqID}, Acc} = do_get(Sender, BKey, ReqId, Acc0),
+                                riak_core_vnode:reply(Sender, {r, Retval, Idx, ReqID}),
+                                Acc
+                            end, State0, Operations),
+        handle_pending_gets(Rest, Minimum, State);
+    false ->
+        {Gets, State0}
+    end.
 
 -ifdef(TEST).
 
