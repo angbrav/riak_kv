@@ -28,6 +28,7 @@
 
 -define(FIXED_N_VAL, 3).
 -define(FIXED_W_VAL, 2).
+-define(FIXED_R_VAL, 1).
 -define(GET_OP_TS_TIMEOUT, infinity).
 -define(UPDATE_PROPAGATION_TIMEOUT, infinity).
 -define(KV_PUT_REQ_CAUSAL, #riak_kv_put_req_causal).
