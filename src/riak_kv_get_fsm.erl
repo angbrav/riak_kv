@@ -23,11 +23,12 @@
 -module(riak_kv_get_fsm).
 -behaviour(gen_fsm).
 -include_lib("riak_kv_vnode.hrl").
+-include_lib("riak_kv_causal.hrl").
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 -export([test_link/7, test_link/5]).
 -endif.
--export([start/6, start_link/6, start_link/4]).
+-export([start/6, start_link/6, start_link/4, start_link/5]).
 -export([init/1, handle_event/3, handle_sync_event/4,
          handle_info/3, terminate/3, code_change/4]).
 -export([prepare/2,validate/2,execute/2,waiting_vnode_r/2,waiting_read_repair/2]).
@@ -74,7 +75,8 @@
                 timing = [] :: [{atom(), erlang:timestamp()}],
                 calculated_timings :: {ResponseUSecs::non_neg_integer(),
                                        [{StateName::atom(), TimeUSecs::non_neg_integer()}]} | undefined,
-                crdt_op :: undefined | true
+                crdt_op :: undefined | true,
+                causal_clock :: integer()
                }).
 
 -include("riak_kv_dtrace.hrl").
@@ -94,6 +96,9 @@ start(ReqId,Bucket,Key,R,Timeout,From) ->
 start_link(ReqId,Bucket,Key,R,Timeout,From) ->
     start_link({raw, ReqId, From}, Bucket, Key, [{r, R}, {timeout, Timeout}]).
 
+start_link(From, Bucket, Key, GetOptions) ->
+    start_link(From, no_dependencies, Bucket, Key, GetOptions).
+
 %% @doc Start the get FSM - retrieve Bucket/Key with the options provided
 %%
 %% {r, pos_integer()}        - Minimum number of successful responses
@@ -104,14 +109,15 @@ start_link(ReqId,Bucket,Key,R,Timeout,From) ->
 %% {timeout, pos_integer() | infinity} -  Timeout for vnode responses
 -spec start_link({raw, req_id(), pid()}, binary(), binary(), options()) ->
                         {ok, pid()} | {error, any()}.
-start_link(From, Bucket, Key, GetOptions) ->
+
+start_link(From, CausalClock, Bucket, Key, GetOptions) ->
     case whereis(riak_kv_get_fsm_sj) of
         undefined ->
             %% Overload protection disabled 
-            Args = [From, Bucket, Key, GetOptions, true],
+            Args = [From, CausalClock, Bucket, Key, GetOptions, true],
             gen_fsm:start_link(?MODULE, Args, []);
         _ ->
-            Args = [From, Bucket, Key, GetOptions, false],
+            Args = [From, CausalClock, Bucket, Key, GetOptions, false],
             case sidejob_supervisor:start_child(riak_kv_get_fsm_sj,
                                                 gen_fsm, start_link,
                                                 [?MODULE, Args, []]) of
@@ -147,14 +153,21 @@ test_link(From, Bucket, Key, GetOptions, StateProps) ->
 %% ====================================================================
 
 %% @private
-init([From, Bucket, Key, Options0, Monitor]) ->
+init([From, CausalClock0, Bucket, Key, Options0, Monitor]) ->
     StartNow = os:timestamp(),
     Options = proplists:unfold(Options0),
+    CausalClock = case CausalClock0 of
+                  no_dependencies ->
+                    0;
+                  _ ->
+                    CausalClock0
+                  end,
     StateData = #state{from = From,
                        options = Options,
                        bkey = {Bucket, Key},
                        timing = riak_kv_fsm_timing:add_timing(prepare, []),
-                       startnow = StartNow},
+                       startnow = StartNow,
+                       causal_clock = CausalClock},
     (Monitor =:= true) andalso riak_kv_get_put_monitor:get_fsm_spawned(self()),
     Trace = app_helper:get_env(riak_kv, fsm_trace_enabled),
     case Trace of 
@@ -197,17 +210,18 @@ prepare(timeout, StateData=#state{bkey=BKey={Bucket,_Key},
                 BucketProps
         end,
     DocIdx = riak_core_util:chash_key(BKey, BucketProps),
-    Bucket_N = get_option(n_val, BucketProps),
+    _Bucket_N = get_option(n_val, BucketProps),
     CrdtOp = get_option(crdt_op, Options),
-    N = case get_option(n_val, Options) of
-            undefined ->
-                Bucket_N;
-            N_val when is_integer(N_val), N_val > 0, N_val =< Bucket_N ->
+    N = ?FIXED_N_VAL,
+    %N = case get_option(n_val, Options) of
+    %        undefined ->
+    %            Bucket_N;
+    %        N_val when is_integer(N_val), N_val > 0, N_val =< Bucket_N ->
                 %% don't allow custom N to exceed bucket N
-                N_val;
-            Bad_N ->
-                {error, {n_val_violation, Bad_N}}
-        end,
+    %            N_val;
+    %        Bad_N ->
+    %            {error, {n_val_violation, Bad_N}}
+    %    end,
     case N of
         {error, _} = Error ->
             StateData2 = client_reply(Error, StateData),
@@ -242,8 +256,10 @@ validate(timeout, StateData=#state{from = {raw, ReqId, _Pid}, options = Options,
               end,
     R0 = get_option(r, Options, ?DEFAULT_R),
     PR0 = get_option(pr, Options, ?DEFAULT_PR),
-    R = riak_kv_util:expand_rw_value(r, R0, BucketProps, N),
-    PR = riak_kv_util:expand_rw_value(pr, PR0, BucketProps, N),
+    %R = riak_kv_util:expand_rw_value(r, R0, BucketProps, N),
+    %PR = riak_kv_util:expand_rw_value(pr, PR0, BucketProps, N),
+    R = ?FIXED_R_VAL,
+    PR = ?FIXED_R_VAL,
     NumVnodes = length(PL2),
     NumPrimaries = length([x || {_,primary} <- PL2]),
     IdxType = [{Part, Type} || {{Part, _Node}, Type} <- PL2],
@@ -295,6 +311,7 @@ validate_quorum(_R, _ROpt, _N, _PR, _PROpt, _NumPrimaries, _NumVnodes) ->
 %% @private
 execute(timeout, StateData0=#state{timeout=Timeout,req_id=ReqId,
                                    bkey=BKey, trace=Trace,
+                                   causal_clock=CausalClock,
                                    preflist2 = Preflist2}) ->
     TRef = schedule_timeout(Timeout),
     Preflist = [IndexNode || {IndexNode, _Type} <- Preflist2],
@@ -306,7 +323,7 @@ execute(timeout, StateData0=#state{timeout=Timeout,req_id=ReqId,
         _ ->
             ok
     end,
-    riak_kv_vnode:get(Preflist, BKey, ReqId),
+    riak_kv_vnode:get(Preflist, BKey, ReqId, CausalClock),
     StateData = StateData0#state{tref=TRef},
     new_state(waiting_vnode_r, StateData).
 
