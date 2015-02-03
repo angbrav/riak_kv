@@ -670,7 +670,7 @@ execute_remote(StateData=#state{robj=RObj, req_id = ReqId,
 waiting_remote_vnode(request_timeout, StateData=#state{trace = Trace}) ->
     ?DTRACE(Trace, ?C_PUT_FSM_WAITING_REMOTE_VNODE, [-1], []),
     process_reply({error,timeout}, StateData);
-waiting_remote_vnode({Result, _TS}, StateData = #state{putcore = PutCore,
+waiting_remote_vnode({Result, TS}, StateData = #state{putcore = PutCore,
                                                 trace = Trace}) ->
     case Trace of
         true ->
@@ -683,7 +683,16 @@ waiting_remote_vnode({Result, _TS}, StateData = #state{putcore = PutCore,
     UpdPutCore1 = riak_kv_put_core:add_result(Result, PutCore),
     case riak_kv_put_core:enough(UpdPutCore1) of
         true ->
-            {Reply, UpdPutCore2} = riak_kv_put_core:response(UpdPutCore1),
+            {Reply0, UpdPutCore2} = riak_kv_put_core:response(UpdPutCore1),
+            Reply = case Reply0 of
+                    ok ->
+                        {ok, TS};
+                    {ok, Obj} ->
+                        {ok, {Obj, TS}};
+                    Other ->
+                        lager:error("Error when preparing reply for client. Reply from riak_kv_put_core not expected: ~p", [Other]),
+                        Other
+                    end,
             process_reply(Reply, StateData#state{putcore = UpdPutCore2});
         false ->
             {next_state, waiting_remote_vnode, StateData#state{putcore = UpdPutCore1}}

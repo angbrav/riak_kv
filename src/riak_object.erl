@@ -126,11 +126,11 @@ new_int(B, K, V, MD) ->
                 no_initial_metadata ->
                     Contents = [#r_content{metadata=dict:new(), value=V}],
                     #r_object{bucket=B,key=K,
-                              contents=Contents,vclock=vclock:fresh()};
+                              contents=Contents,vclock=vclock:fresh(),timestamp=0};
                 _ ->
                     Contents = [#r_content{metadata=MD, value=V}],
                     #r_object{bucket=B,key=K,updatemetadata=MD,
-                              contents=Contents,vclock=vclock:fresh()}
+                              contents=Contents,vclock=vclock:fresh(),timestamp=0}
             end
     end.
 
