@@ -1,6 +1,6 @@
 -record(riak_kv_pending_put, {
           bkey :: {binary(), binary()},
-          object :: term(),
+          operation :: term(),
           req_id :: non_neg_integer(),
           start_time :: non_neg_integer(),
           options :: list(),
@@ -15,7 +15,7 @@
 -record(riak_kv_put_req_causal, {
           time_stamp :: integer(),
           bkey :: {binary(),binary()},
-          object :: term(),
+          operation :: term(),
           req_id :: non_neg_integer(),
           start_time :: non_neg_integer(),
           options :: list()}).
