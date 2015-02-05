@@ -28,6 +28,7 @@
 -endif.
 -include("riak_kv_wm_raw.hrl").
 -include("riak_object.hrl").
+-include("riak_kv_causal.hrl").
 
 -export_type([riak_object/0, bucket/0, key/0, value/0, binary_version/0]).
 
@@ -56,7 +57,11 @@
           contents :: [#r_content{}],
           vclock = vclock:fresh() :: vclock:vclock(),
           updatemetadata=dict:store(clean, true, dict:new()) :: dict(),
-          updatevalue :: term()
+          updatevalue :: term(),
+          crdt :: term(),
+          value :: term(),
+          time_stamp = 0 :: integer(),
+          concurrent = [] :: [term()]
          }).
 -opaque riak_object() :: #r_object{}.
 
@@ -91,6 +96,7 @@
 -export([is_robject/1]).
 -export([update_last_modified/1]).
 -export([strict_descendant/2]).
+-export([init_crdt/2, update_crdt/6, get_crdt_value/1, get_safe_timestamp/1]).
 
 %% @doc Constructor for new riak objects.
 -spec new(Bucket::bucket(), Key::key(), Value::value()) -> riak_object().
@@ -126,11 +132,11 @@ new_int(B, K, V, MD) ->
                 no_initial_metadata ->
                     Contents = [#r_content{metadata=dict:new(), value=V}],
                     #r_object{bucket=B,key=K,
-                              contents=Contents,vclock=vclock:fresh(),timestamp=0};
+                              contents=Contents,vclock=vclock:fresh(),time_stamp=0};
                 _ ->
                     Contents = [#r_content{metadata=MD, value=V}],
                     #r_object{bucket=B,key=K,updatemetadata=MD,
-                              contents=Contents,vclock=vclock:fresh(),timestamp=0}
+                              contents=Contents,vclock=vclock:fresh(),time_stamp=0}
             end
     end.
 
@@ -138,6 +144,41 @@ is_robject(#r_object{}) ->
     true;
 is_robject(_) ->
     false.
+
+init_crdt(Obj, CRDTType) ->
+    {ok, Obj#r_object{crdt=CRDTType:new()}}.
+
+update_crdt(Obj=#r_object{concurrent=Concurrent0, crdt=CRDT0, time_stamp=TimeStamp0}, CRDTType, OperationName, Args, Clock, Replica) ->
+    case TimeStamp0 < Clock of
+    true ->
+        CRDT = CRDTType:OperationName(Args, CRDT0),
+        Value = CRDTType:value(CRDT),
+        {ok, Obj#r_object{crdt=CRDT, value=Value, concurrent=[Replica], time_stamp=Clock}};
+    false ->
+        case TimeStamp0 == Clock of
+            true ->
+                case seen(Replica, Concurrent0) of
+                    false ->
+                        CRDT = CRDTType:OperationName(Args, CRDT0),
+                        Value = CRDTType:value(CRDT),
+                        {ok, Obj#r_object{crdt=CRDT, value=Value, concurrent=Concurrent0 ++ [Replica]}};
+                    _ ->
+                        {ok, Obj}
+                end;
+           false ->
+                lager:error("Something went wrong. receiving operations out of causal order"),
+                {error, out_of_causal_order, past_message}
+        end
+    end.
+
+seen(Replica, Concurrent) ->
+    lists:member(Replica, Concurrent).
+
+get_crdt_value(_Obj=#r_object{value=Value}) ->
+    {ok, Value}.
+
+get_safe_timestamp(_Obj=#r_object{time_stamp=TS}) ->
+    {ok, TS+1}.
 
 %% @doc Ensure the incoming term is a riak_object.
 -spec ensure_robject(any()) -> riak_object().
