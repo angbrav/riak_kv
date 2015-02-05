@@ -34,8 +34,8 @@
 
 -behaviour(gen_fsm).
 -define(DEFAULT_OPTS, [{returnbody, false}, {update_last_modified, true}]).
--export([start/3, start/6,start/7]).
--export([start_link/3,start_link/4,start_link/6,start_link/7]).
+-export([start/4, start/7,start/8]).
+-export([start_link/4,start_link/5,start_link/7,start_link/8]).
 -export([set_put_coordinator_failure_timeout/1,
          get_put_coordinator_failure_timeout/0]).
 -ifdef(TEST).
@@ -73,6 +73,7 @@
         {sloppy_quorum, boolean()} |
         %% The N value, default = value from bucket properties
         {n_val, pos_integer()} |
+        {crdt_type , atom()} |
         %% Control server-side put failure retry, default = true.
         %% Some CRDTs and other client operations that cannot tolerate
         %% an automatic retry on the server side; those operations should
@@ -85,6 +86,7 @@
 
 -record(state, {from :: {raw, integer(), pid()},
                 robj :: riak_object:riak_object(),
+                operation :: {atom(), list()},
                 options=[] :: options(),
                 n :: pos_integer(),
                 w :: non_neg_integer(),
@@ -125,31 +127,31 @@
 %% Public API
 %% ===================================================================
 
-start(From, Object, PutOptions) ->
-    gen_fsm:start(?MODULE, [From, Object, PutOptions], []).
+start(From, BKey, Operation, PutOptions) ->
+    gen_fsm:start(?MODULE, [From, BKey, Operation, PutOptions], []).
 
 %% In place only for backwards compatibility
-start(ReqId,RObj,W,DW,Timeout,ResultPid) ->
-    start_link(ReqId,RObj,W,DW,Timeout,ResultPid,[]).
+start(ReqId,BKey,Operation,W,DW,Timeout,ResultPid) ->
+    start_link(ReqId,BKey,Operation,W,DW,Timeout,ResultPid,[]).
 
 %% In place only for backwards compatibility
-start(ReqId,RObj,W,DW,Timeout,ResultPid,Options) ->
-    start_link(ReqId,RObj,W,DW,Timeout,ResultPid,Options).
+start(ReqId,BKey,Operation,W,DW,Timeout,ResultPid,Options) ->
+    start_link(ReqId,BKey,Operation,W,DW,Timeout,ResultPid,Options).
 
-start_link(ReqId,RObj,W,DW,Timeout,ResultPid) ->
-    start_link(ReqId,RObj,W,DW,Timeout,ResultPid,[]).
+start_link(ReqId,BKey,Operation,W,DW,Timeout,ResultPid) ->
+    start_link(ReqId,BKey,Operation,W,DW,Timeout,ResultPid,[]).
 
-start_link(ReqId,RObj,W,DW,Timeout,ResultPid,Options) ->
-    start_link({raw, ReqId, ResultPid}, RObj, [{w, W}, {dw, DW}, {timeout, Timeout} | Options]).
+start_link(ReqId,BKey,Operation,W,DW,Timeout,ResultPid,Options) ->
+    start_link({raw, ReqId, ResultPid}, BKey, Operation, [{w, W}, {dw, DW}, {timeout, Timeout} | Options]).
 
-start_link(From, Object, PutOptions) ->
+start_link(From, BKey, Operation, PutOptions) ->
     case whereis(riak_kv_put_fsm_sj) of
         undefined ->
             %% Overload protection disabled
-            Args = [From, no_dependencies, Object, PutOptions, true],
+            Args = [From, no_dependencies, BKey, Operation, PutOptions, true],
             gen_fsm:start_link(?MODULE, Args, []);
         _ ->
-            Args = [From, no_dependencies, Object, PutOptions, false],
+            Args = [From, no_dependencies, BKey, Operation, PutOptions, false],
             case sidejob_supervisor:start_child(riak_kv_put_fsm_sj,
                                                 gen_fsm, start_link,
                                                 [?MODULE, Args, []]) of
@@ -161,14 +163,14 @@ start_link(From, Object, PutOptions) ->
             end
     end.
 
-start_link(From, CausalClock, Object, PutOptions) ->
+start_link(From, CausalClock, BKey, Operation, PutOptions) ->
     case whereis(riak_kv_put_fsm_sj) of
         undefined ->
             %% Overload protection disabled
-            Args = [From, CausalClock, Object, PutOptions, true],
+            Args = [From, CausalClock, BKey, Operation, PutOptions, true],
             gen_fsm:start_link(?MODULE, Args, []);
         _ ->
-            Args = [From, CausalClock, Object, PutOptions, false],
+            Args = [From, CausalClock, BKey, Operation, PutOptions, false],
             case sidejob_supervisor:start_child(riak_kv_put_fsm_sj,
                                                 gen_fsm, start_link,
                                                 [?MODULE, Args, []]) of
@@ -252,11 +254,12 @@ test_link(From, Object, PutOptions, StateProps) ->
 %% ====================================================================
 
 %% @private
-init([From, CausalClock, RObj, Options0, Monitor]) ->
-    BKey = {Bucket, Key} = {riak_object:bucket(RObj), riak_object:key(RObj)},
+init([From, CausalClock, BKey, Operation, Options0, Monitor]) ->
+    {Bucket, Key} = BKey, 
     CoordTimeout = get_put_coordinator_failure_timeout(),
     Trace = app_helper:get_env(riak_kv, fsm_trace_enabled),
     Options = proplists:unfold(Options0),
+    RObj = riak_object:new(Bucket, Key, undefined),
     case CausalClock of
     no_dependencies ->
         CausalClock2 = 0;
@@ -264,6 +267,7 @@ init([From, CausalClock, RObj, Options0, Monitor]) ->
         CausalClock2 = CausalClock
     end,
     StateData = #state{from = From,
+                       operation = Operation,
                        robj = RObj,
                        bkey = BKey,
                        trace = Trace,
@@ -306,14 +310,16 @@ init({test, Args, StateProps}) ->
     {ok, validate, TestStateData, 0}.
 
 %% @private
-prepare(timeout, StateData0 = #state{from = From, robj = RObj,
+prepare(timeout, StateData0 = #state{from = From, operation = Operation,
                                      bkey = BKey = {Bucket, _Key},
                                      options = Options,
                                      trace = Trace,
-                                     bad_coordinators = BadCoordinators}) ->
+                                     bad_coordinators = BadCoordinators,
+                                     causal_clock = CausalClock}) ->
     {ok, DefaultProps} = application:get_env(riak_core, 
                                              default_bucket_props),
-    BucketProps = riak_core_bucket:get_bucket(riak_object:bucket(RObj)),
+    %%BucketProps = riak_core_bucket:get_bucket(riak_object:bucket(RObj)),
+    BucketProps = riak_core_bucket:get_bucket(Bucket),
     %% typed buckets never fall back to defaults
     Props = 
         case is_tuple(Bucket) of
@@ -374,7 +380,7 @@ prepare(timeout, StateData0 = #state{from = From, robj = RObj,
                                                [{ack_execute, self()}|Options]),
                         MiddleMan = spawn_coordinator_proc(
                                       CoordNode, riak_kv_put_fsm, start_link,
-                                      [From,RObj,Options2]),
+                                      [From, CausalClock, BKey, Operation, Options2]),
                         ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [2],
                                 ["prepare", atom2list(CoordNode)]),
                         riak_kv_stat:update(coord_redir),
@@ -418,7 +424,7 @@ prepare(timeout, StateData0 = #state{from = From, robj = RObj,
 %% @private
 validate(timeout, StateData0 = #state{from = {raw, ReqId, _Pid},
                                       options = Options0,
-                                      robj = RObj0,
+                                      robj = _RObj0,
                                       n=N, bucket_props = BucketProps,
                                       trace = Trace,
                                       preflist2 = Preflist2}) ->
@@ -504,7 +510,6 @@ validate(timeout, StateData0 = #state{from = {raw, ReqId, _Pid},
                                          precommit = Precommit,
                                          postcommit = Postcommit,
                                          req_id = ReqId,
-                                         robj = apply_updates(RObj0, Options),
                                          putcore = PutCore,
                                          vnode_options = VNodeOpts,
                                          timeout = Timeout},
@@ -517,15 +522,15 @@ validate(timeout, StateData0 = #state{from = {raw, ReqId, _Pid},
             end
     end.
 
-apply_updates(RObj0, Options) ->
-    RObj1 = 
-        case get_option(update_last_modified, Options) of
-            true ->
-                riak_object:update_last_modified(RObj0);
-            _ ->
-                RObj0
-        end,
-    riak_object:apply_updates(RObj1).
+%apply_updates(RObj0, Options) ->
+%    RObj1 = 
+%        case get_option(update_last_modified, Options) of
+%            true ->
+%                riak_object:update_last_modified(RObj0);
+%            _ ->
+%                RObj0
+%        end,
+%    riak_object:apply_updates(RObj1).
     
 
 %% Run the precommit hooks
@@ -571,6 +576,7 @@ execute(State=#state{options = Options, coord_pl_entry = CPL}) ->
 %% will guarantee a frontier object.
 %% N.B. Not actually a state - here in the source to make reading the flow easier
 execute_local(StateData=#state{robj=RObj, req_id = ReqId,
+                               operation = Operation,
                                timeout=Timeout, bkey=BKey,
                                coord_pl_entry = {_Index, Node} = CoordPLEntry,
                                vnode_options=VnodeOptions,
@@ -586,7 +592,8 @@ execute_local(StateData=#state{robj=RObj, req_id = ReqId,
                 StateData
         end,
     TRef = schedule_timeout(Timeout),
-    riak_kv_vnode:coord_put(CoordPLEntry, BKey, RObj, ReqId, StartTime, VnodeOptions, CausalClock),
+    lager:info("Opetions ~p", [VnodeOptions]),
+    riak_kv_vnode:coord_put(CoordPLEntry, BKey, Operation, ReqId, StartTime, VnodeOptions, CausalClock),
     StateData2 = StateData1#state{robj = RObj, tref = TRef},
     %% Must always wait for local vnode - it contains the object with updated vclock
     %% to use for the remotes. (Ignore optimization for N=1 case for now).
@@ -627,7 +634,8 @@ waiting_local_vnode({Result, TS}, StateData = #state{putcore = PutCore,
 %% Send the put requests to any remote nodes if necessary and decided if
 %% enough responses have been received yet (i.e. if W/DW=1)
 %% N.B. Not actually a state - here in the source to make reading the flow easier
-execute_remote(StateData=#state{robj=RObj, req_id = ReqId,
+execute_remote(StateData=#state{req_id = ReqId,
+                                operation=Operation,
                                 preflist2 = Preflist2, bkey = BKey,
                                 coord_pl_entry = CoordPLEntry,
                                 vnode_options = VnodeOptions,
@@ -649,7 +657,7 @@ execute_remote(StateData=#state{robj=RObj, req_id = ReqId,
         end,
     %riak_kv_vnode:put(Preflist, BKey, RObj, ReqId, StartTime, VnodeOptions),
     try
-        riak_kv_vnode:propagate_update(CoordPLEntry, Preflist, BKey, RObj, ReqId, StartTime, VnodeOptions, TimeStamp, ?UPDATE_PROPAGATION_TIMEOUT),
+        riak_kv_vnode:propagate_update(CoordPLEntry, Preflist, BKey, Operation, ReqId, StartTime, VnodeOptions, TimeStamp, ?UPDATE_PROPAGATION_TIMEOUT),
         case riak_kv_put_core:enough(PutCore) of
             true ->
                 {Reply, UpdPutCore} = riak_kv_put_core:response(PutCore),
@@ -879,6 +887,9 @@ handle_options([{returnbody, true}|T], Acc) ->
     VNodeOpts = [{returnbody, true} | Acc],
     handle_options(T, VNodeOpts);
 handle_options([{counter_op, _Amt}=COP|T], Acc) ->
+    VNodeOpts = [COP | Acc],
+    handle_options(T, VNodeOpts);
+handle_options([{crdt_type, _Amt}=COP|T], Acc) ->
     VNodeOpts = [COP | Acc],
     handle_options(T, VNodeOpts);
 handle_options([{crdt_op, _Op}=COP|T], Acc) ->

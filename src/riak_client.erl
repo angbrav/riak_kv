@@ -25,6 +25,7 @@
 -module(riak_client).
 
 -export([new/2]).
+-export([causal_put/5, causal_get/5]).
 -export([get/3,get/4,get/5]).
 -export([put/2,put/3,put/4,put/5,put/6]).
 -export([delete/3,delete/4,delete/5]).
@@ -147,6 +148,8 @@ get(Bucket, Key, Options, {?MODULE, [_Node, _ClientId]}=THIS) when is_list(Optio
 get(Bucket, Key, R, {?MODULE, [_Node, _ClientId]}=THIS) ->
     get(Bucket, no_dependencies, Key, [{r, R}], THIS).
 
+causal_get(Bucket, CausalClock, Key, Options, {?MODULE, [_Node, _ClientId]}=THIS) when is_list(Options) ->
+    normal_get(Bucket, CausalClock, Key, Options, THIS).
 %% @spec get(riak_object:bucket(), riak_object:key(), options(), riak_client()) ->
 %%       {ok, riak_object:riak_object()} |
 %%       {error, notfound} |
@@ -166,6 +169,7 @@ get(Bucket, CausalClock, Key, Options, {?MODULE, [Node, _ClientId]}=THIS) when i
         {error,_}=Err ->
             Err
     end;
+
 
 %% @spec get(riak_object:bucket(), riak_object:key(), R :: integer(),
 %%           TimeoutMillisecs :: integer(), riak_client()) ->
@@ -278,6 +282,20 @@ put(RObj, Options, {?MODULE, [_Node, _ClientId]}=THIS) when is_list(Options) ->
 %%      Return as soon as at least W nodes have received the request.
 %% @equiv put(RObj, [{w, W}, {dw, W}])
 put(RObj, W, {?MODULE, [_Node, _ClientId]}=THIS) -> put(RObj, no_dependencies, [{w, W}, {dw, W}], THIS).
+
+
+causal_put(BKey, Operation, CausalClock, Options, {?MODULE, [Node, _ClientId]}=_THIS) ->
+    Me = self(),
+    ReqId = mk_reqid(),
+    case node() of
+        Node ->
+            riak_kv_put_fsm:start_link({raw, ReqId, Me}, CausalClock, BKey, Operation, Options);
+        _ ->
+            proc_lib:spawn_link(Node, riak_kv_put_fsm, start_link,
+                                        [{raw, ReqId, Me}, CausalClock, BKey, Operation, Options])
+    end,
+    Timeout = recv_timeout(Options),
+    wait_for_reqid(ReqId, Timeout).
 
 %% @spec put(RObj :: riak_object:riak_object(), riak_kv_put_fsm:options(), riak_client()) ->
 %%       ok |

@@ -156,13 +156,18 @@
                   coord:: boolean(),
                   lww :: boolean(),
                   bkey :: {binary(), binary()},
+                  operation :: {term(), term()},
                   robj :: term(),
+                  object :: term(),
                   index_specs=[] :: [{index_op(), binary(), index_value()}],
                   reqid :: non_neg_integer(),
                   bprops :: maybe_improper_list(),
                   starttime :: non_neg_integer(),
                   prunetime :: undefined| non_neg_integer(),
                   is_index=false :: boolean(), %% set if the b/end supports indexes
+                  crdt_type = undefined :: undefined | atom(),
+                  replica :: term(),
+                  time_stamp :: integer(),
                   crdt_op = undefined :: undefined | term() %% if set this is a crdt operation
                  }).
 
@@ -241,25 +246,26 @@ del(Preflist, BKey, ReqId) ->
 
 %% Issue a put for the object to the preflist, expecting a reply
 %% to an FSM.
-put(Preflist, BKey, Obj, ReqId, StartTime, Options) when is_integer(StartTime) ->
-    put(Preflist, BKey, Obj, ReqId, StartTime, Options, {fsm, undefined, self()}).
+put(Preflist, BKey, Operation, ReqId, StartTime, Options) when is_integer(StartTime) ->
+    put(Preflist, BKey, Operation, ReqId, StartTime, Options, {fsm, undefined, self()}).
 
-put(Preflist, BKey, Obj, ReqId, StartTime, Options, Sender) ->
-    put(Preflist, BKey, Obj, ReqId, StartTime, Options, Sender, 0).
+put(Preflist, BKey, Operation, ReqId, StartTime, Options, Sender) ->
+    put(Preflist, BKey, Operation, ReqId, StartTime, Options, Sender, 0).
 
-put(Preflist, BKey, Obj, ReqId, StartTime, Options, Sender, TimeStamp)
+put(Preflist, BKey, Operation, ReqId, StartTime, Options, Sender, TimeStamp)
   when is_integer(StartTime) ->
     riak_core_vnode_master:command(Preflist,
                                    {?KV_PUT_REQ_CAUSAL{
                                       time_stamp=TimeStamp,
                                       bkey = sanitize_bkey(BKey),
-                                      object = Obj,
+                                      operation = Operation,
                                       req_id = ReqId,
                                       start_time = StartTime,
                                       options = Options},false},
                                    Sender,
                                    riak_kv_vnode_master).
-
+%%I do not know who might call this. This could fail due to the change of
+%%operation-based to state-base. Grep though cannot find who call it.
 local_put(Index, Obj) ->
     local_put(Index, Obj, []).
 
@@ -295,32 +301,32 @@ refresh_index_data(Partition, BKey, IdxData, TimeOut) ->
 
 %% Issue a put for the object to the preflist, expecting a reply
 %% to an FSM.
-coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options) when is_integer(StartTime) ->
-    coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options, {fsm, undefined, self()}).
+coord_put(IndexNode, BKey, Operation, ReqId, StartTime, Options) when is_integer(StartTime) ->
+    coord_put(IndexNode, BKey, Operation, ReqId, StartTime, Options, {fsm, undefined, self()}).
 
-coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options, CausalClock)
+coord_put(IndexNode, BKey, Operation, ReqId, StartTime, Options, CausalClock)
   when is_integer(CausalClock) ->
-    coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options, {fsm, undefined, self()}, CausalClock);
+    coord_put(IndexNode, BKey, Operation, ReqId, StartTime, Options, {fsm, undefined, self()}, CausalClock);
 
-coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options, Sender) ->
-    coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options, Sender, 0).
+coord_put(IndexNode, BKey, Operation, ReqId, StartTime, Options, Sender) ->
+    coord_put(IndexNode, BKey, Operation, ReqId, StartTime, Options, Sender, 0).
 
-coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options, Sender, CausalClock)
+coord_put(IndexNode, BKey, Operation, ReqId, StartTime, Options, Sender, CausalClock)
   when is_integer(StartTime) ->
     riak_core_vnode_master:command(IndexNode,
                                    {?KV_PUT_REQ_CAUSAL{
                                       time_stamp = CausalClock,
                                       bkey = sanitize_bkey(BKey),
-                                      object = Obj,
+                                      operation = Operation,
                                       req_id = ReqId,
                                       start_time = StartTime,
                                       options = [coord | Options]},true},
                                    Sender,
                                    riak_kv_vnode_master).
 
-propagate_update(IndexNode, Preflist, BKey, Obj, ReqId, StartTime, Options, TimeStamp, TimeOut) ->
+propagate_update(IndexNode, Preflist, BKey, Operation, ReqId, StartTime, Options, TimeStamp, TimeOut) ->
     riak_core_vnode_master:sync_command(IndexNode,
-                                        {propagate_update, Preflist, BKey, Obj, ReqId, StartTime, Options, TimeStamp},
+                                        {propagate_update, Preflist, BKey, Operation, ReqId, StartTime, Options, TimeStamp},
                                         riak_kv_vnode_master,
                                         TimeOut).
 
@@ -569,19 +575,22 @@ handle_overload_info(_, _) ->
 
 handle_command({?KV_PUT_REQ_CAUSAL{time_stamp=TimeStamp0,
                            bkey=BKey,
-                           object=Object,
+                           operation=Operation,
                            req_id=ReqId,
                            start_time=StartTime,
-                           options=Options}, Coord},
+                           options=Options0}, Coord},
                Sender, State=#state{idx=Idx, monotonic_clocks=MonotonicClocks, pending_puts=PendingPuts0, max_ts=MaxTS}) ->
+    lager:info("Options ~p", [Options0]),
     case Coord of
     true ->
+        Options = [{partition, Idx} | Options0],
         TimeStamp = max(now_milisec(erlang:now()), max(MaxTS + 1, TimeStamp0 + 1));
     false ->
+        Options = Options0,
         TimeStamp=TimeStamp0
     end,
     StartTS = os:timestamp(),
-    %% TODO: Remove this message
+    %% TODO: Eventually remove this message
     riak_core_vnode:reply(Sender, {{w, Idx, ReqId}, TimeStamp}),
     Preflist = get_primary_preflist(BKey, ?FIXED_N_VAL),
     try
@@ -589,19 +598,19 @@ handle_command({?KV_PUT_REQ_CAUSAL{time_stamp=TimeStamp0,
         case TimeStamp > (Clock + 1) of
         true -> 
             Puts0 = dict:fetch(Preflist, PendingPuts0),
-            Pending=?KV_PUT_PENDING{bkey=BKey, object=Object, req_id=ReqId, start_time=StartTime, options=Options, sender=Sender},
+            Pending=?KV_PUT_PENDING{bkey=BKey, operation=Operation, req_id=ReqId, start_time=StartTime, options=Options, sender=Sender},
             Puts = orddict:append(TimeStamp, Pending, Puts0),
             PendingPuts = dict:store(Preflist, Puts, PendingPuts0),
             riak_core_vnode:reply(Sender, {{dw, Idx, ReqId}, TimeStamp}),
             {noreply, State#state{pending_puts=PendingPuts}};
         false ->
-            UpdState1 = do_put(Sender, BKey,  Object, ReqId, StartTime, Options, State, TimeStamp, true),
+            UpdState1 = do_put(Sender, BKey, Operation, ReqId, StartTime, Options, State, TimeStamp, true),
             update_vnode_stats(vnode_put, Idx, StartTS),
             {noreply, UpdState1}
         end
     catch Error:Reason ->
         lager:error("No monotonic clocks when put for preflist: ~p.\nThe given error is: ~p and the resaon is ~p",[Preflist, Error, Reason]),
-        UpdState = do_put(Sender, BKey,  Object, ReqId, StartTime, Options, State),
+        UpdState = do_put(Sender, BKey, Operation, ReqId, StartTime, Options, State, no_clock, true),
         update_vnode_stats(vnode_put, Idx, StartTS),
         {noreply, UpdState}
     end;
@@ -769,8 +778,8 @@ handle_command({refresh_index_data, BKey, OldIdxData}, Sender,
             {reply, {error, {indexes_not_supported, Mod}}, State}
     end;
 
-handle_command({propagate_update, Preflist, BKey, Obj, ReqId, StartTime, Options, TimeStamp}, _Sender={server, undefined, {Pid, _Ref}}, State) ->
-    riak_kv_vnode:put(Preflist, BKey, Obj, ReqId, StartTime, Options, {fsm, undefined, Pid}, TimeStamp),
+handle_command({propagate_update, Preflist, BKey, Operation, ReqId, StartTime, Options, TimeStamp}, _Sender={server, undefined, {Pid, _Ref}}, State=#state{idx=Index}) ->
+    riak_kv_vnode:put(Preflist, BKey, Operation, ReqId, StartTime, [{partition, Index} | Options], {fsm, undefined, Pid}, TimeStamp),
     {reply, ok, State};
 
 handle_command(send_heartbeat, _Sender, State=#state{replication_groups=ReplicationGroups, idx=Index}) ->
@@ -1189,7 +1198,8 @@ encode_handoff_item({B, K}, V) ->
     %% before sending data to another node change binary version
     %% to one supported by the cluster. This way we don't send
     %% unsupported formats to old nodes
-    ObjFmt = riak_core_capability:get({riak_kv, object_format}, v0),
+    %ObjFmt = riak_core_capability:get({riak_kv, object_format}, v0),
+    ObjFmt = v0,
     try
         Value  = riak_object:to_binary_version(ObjFmt, B, K, V),
         encode_binary_object(B, K, Value)
@@ -1399,12 +1409,54 @@ raw_put({Idx, Node}, Key, Obj) ->
     Proxy ! {raw_put, Key, Obj},
     ok.
 
+prepare_causal_put(#state{vnodeid=_VId,
+                          mod=Mod,
+                          modstate=ModState,
+                          idx=_Idx},
+                   PutArgs=#putargs{bkey={Bucket, Key}=_BKey,
+                                    bprops=_BProps,
+                                    coord=_Coord,
+                                    lww=_LWW,
+                                    operation={OperationName, Args}=_Operation,
+                                    starttime=_StartTime,
+                                    prunetime=_PruneTime,
+                                    crdt_op = _CRDTOp,
+                                    crdt_type =  CRDTType,
+                                    time_stamp = TimeStamp,
+                                    replica = Replica}) ->
+    {ok, Capabilities} = Mod:capabilities(Bucket, ModState),
+    IndexBackend = lists:member(indexes, Capabilities),
+    GetReply =
+        case do_get_object(Bucket, Key, Mod, ModState) of
+            {error, not_found, _UpModState} ->
+                ok;
+            {ok, TheOldObj, _UpModState} ->
+                {ok, TheOldObj};
+            Error ->
+                lager:error("Error when reading before putting: ~p", [Error])
+        end,
+    lager:info("CRDT type is ~p", [CRDTType]),
+    case GetReply of
+        ok ->
+            ObjToStore0 = riak_object:new(Bucket, Key, <<>>),
+            {ok, ObjToStore1} = riak_object:init_crdt(ObjToStore0, CRDTType),
+            Reply = {Res, ObjToStore}  = riak_object:update_crdt(ObjToStore1, CRDTType, OperationName, Args, TimeStamp, Replica);
+        {ok, OldObj}->
+            Reply = {Res, ObjToStore} = riak_object:update_crdt(OldObj, CRDTType, OperationName, Args, TimeStamp, Replica);
+        _ ->
+            Reply = {Res, ObjToStore} = {error, no_idea}
+    end,
+    case Res of
+        ok ->
+            IndexSpecs = riak_object:index_specs(ObjToStore);
+        _ ->
+            IndexSpecs = []
+    end,
+    {Reply, PutArgs#putargs{index_specs=IndexSpecs, is_index=IndexBackend}}.
+    
 %% @private
 %% upon receipt of a client-initiated put
-do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, StartTime, Options, State) ->
-    do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, StartTime, Options, State, no_clock, true).
-
-do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, StartTime, Options, State, TimeStamp, ReplyBack) ->
+do_put(Sender, {Bucket,_Key}=BKey, Operation, ReqID, StartTime, Options, State, TimeStamp, ReplyBack) ->
     case proplists:get_value(bucket_props, Options) of
         undefined ->
             BProps = riak_core_bucket:get_bucket(Bucket);
@@ -1419,17 +1471,22 @@ do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, StartTime, Options, State, TimeS
     end,
     Coord = proplists:get_value(coord, Options, false),
     CRDTOp = proplists:get_value(counter_op, Options, proplists:get_value(crdt_op, Options, undefined)),
+    CRDTType = proplists:get_value(crdt_type, Options, undefined),
+    Replica = proplists:get_value(partition, Options, undefined),
     PutArgs = #putargs{returnbody=proplists:get_value(returnbody,Options,false) orelse Coord,
                        coord=Coord,
                        lww=proplists:get_value(last_write_wins, BProps, false),
                        bkey=BKey,
-                       robj=RObj,
+                       operation=Operation,
                        reqid=ReqID,
                        bprops=BProps,
                        starttime=StartTime,
                        prunetime=PruneTime,
-                       crdt_op = CRDTOp},
-    {PrepPutRes, UpdPutArgs} = prepare_put(State, PutArgs),
+                       crdt_op = CRDTOp,
+                       crdt_type = CRDTType,
+                       time_stamp = TimeStamp,
+                       replica = Replica},
+    {PrepPutRes, UpdPutArgs} = prepare_causal_put(State, PutArgs),
     {Reply, UpdState} = perform_put(PrepPutRes, State, UpdPutArgs),
     case ReplyBack of
     true ->
@@ -1466,161 +1523,6 @@ do_backend_delete(BKey, RObj, State = #state{idx = Idx,
 delete_hash(RObj) ->
     erlang:phash2(RObj, 4294967296).
 
-prepare_put(State=#state{vnodeid=VId,
-                         mod=Mod,
-                         modstate=ModState},
-            PutArgs=#putargs{bkey={Bucket, _Key},
-                             lww=LWW,
-                             coord=Coord,
-                             robj=RObj,
-                             starttime=StartTime}) ->
-    %% Can we avoid reading the existing object? If this is not an
-    %% index backend, and the bucket is set to last-write-wins, then
-    %% no need to incur additional get. Otherwise, we need to read the
-    %% old object to know how the indexes have changed.
-    {ok, Capabilities} = Mod:capabilities(Bucket, ModState),
-    IndexBackend = lists:member(indexes, Capabilities),
-    case LWW andalso not IndexBackend of
-        true ->
-            ObjToStore =
-                case Coord of
-                    true ->
-                        riak_object:increment_vclock(RObj, VId, StartTime);
-                    false ->
-                        RObj
-                end,
-            {{true, ObjToStore}, PutArgs#putargs{is_index = false}};
-        false ->
-            prepare_put(State, PutArgs, IndexBackend)
-    end.
-prepare_put(#state{vnodeid=VId,
-                   mod=Mod,
-                   modstate=ModState,
-                   idx=Idx,
-                   md_cache=MDCache},
-            PutArgs=#putargs{bkey={Bucket, Key}=BKey,
-                             robj=RObj,
-                             bprops=BProps,
-                             coord=Coord,
-                             lww=LWW,
-                             starttime=StartTime,
-                             prunetime=PruneTime,
-                             crdt_op = CRDTOp},
-            IndexBackend) ->
-    {CacheClock, CacheData} = maybe_check_md_cache(MDCache, BKey),
-
-    RequiresGet =
-        case CacheClock of
-            undefined ->
-                true;
-            Clock ->
-                case vclock:descends(riak_object:vclock(RObj), Clock) of
-                    true ->
-                        false;
-                    _ ->
-                        true
-                end
-        end,
-    GetReply =
-        case RequiresGet of
-            true ->
-                case do_get_object(Bucket, Key, Mod, ModState) of
-                    {error, not_found, _UpdModState} ->
-                        ok;
-                    {ok, TheOldObj, _UpdModState} ->
-                        {ok, TheOldObj}
-                end;
-            false ->
-                FakeObj0 = riak_object:new(Bucket, Key, <<>>),
-                FakeObj = riak_object:set_vclock(FakeObj0, CacheClock),
-                {ok, FakeObj}
-        end,
-    case GetReply of
-        ok ->
-            case IndexBackend of
-                true ->
-                    IndexSpecs = riak_object:index_specs(RObj);
-                false ->
-                    IndexSpecs = []
-            end,
-            case prepare_new_put(Coord, RObj, VId, StartTime, CRDTOp) of
-                {error, E} ->
-                    {{fail, Idx, E}, PutArgs};
-                ObjToStore ->
-                    {{true, ObjToStore},
-                     PutArgs#putargs{index_specs=IndexSpecs,
-                                     is_index=IndexBackend}}
-            end;
-        {ok, OldObj} ->
-            case put_merge(Coord, LWW, OldObj, RObj, VId, StartTime) of
-                {oldobj, OldObj1} ->
-                    {{false, OldObj1}, PutArgs};
-                {newobj, NewObj} ->
-                    VC = riak_object:vclock(NewObj),
-                    AMObj = enforce_allow_mult(NewObj, BProps),
-                    IndexSpecs = case IndexBackend of
-                                     true ->
-                                         case CacheData /= undefined andalso
-                                             RequiresGet == false of
-                                             true ->
-                                                 NewData = riak_object:index_data(AMObj),
-                                                 riak_object:diff_index_data(NewData,
-                                                                             CacheData);
-                                             false ->
-                                                 riak_object:diff_index_specs(AMObj,
-                                                                              OldObj)
-                                         end;
-                                    false ->
-                                         []
-                    end,
-                    ObjToStore = case PruneTime of
-                                     undefined ->
-                                         AMObj;
-                                     _ ->
-                                         riak_object:set_vclock(AMObj,
-                                                                vclock:prune(VC,
-                                                                             PruneTime,
-                                                                             BProps))
-                    end,
-                    case handle_crdt(Coord, CRDTOp, VId, ObjToStore) of
-                        {error, E} ->
-                            {{fail, Idx, E}, PutArgs};
-                        ObjToStore2 ->
-                            {{true, ObjToStore2},
-                             PutArgs#putargs{index_specs=IndexSpecs,
-                                             is_index=IndexBackend}}
-                    end
-            end
-    end.
-
-%% @doc in the case that this a co-ordinating put, prepare the object.
-prepare_new_put(true, RObj, VId, StartTime, undefined) ->
-    riak_object:increment_vclock(RObj, VId, StartTime);
-prepare_new_put(true, RObj, VId, StartTime, CRDTOp) ->
-    VClockUp = riak_object:increment_vclock(RObj, VId, StartTime),
-    %% coordinating a _NEW_ crdt operation means
-    %% creating + updating the crdt.
-    %% Make a new crdt, stuff it in the riak_object
-    do_crdt_update(VClockUp, VId, CRDTOp);
-prepare_new_put(false, RObj, _VId, _StartTime, _CounterOp) ->
-    RObj.
-
-handle_crdt(_, undefined, _VId, RObj) ->
-    RObj;
-handle_crdt(true, CRDTOp, VId, RObj) ->
-    do_crdt_update(RObj, VId, CRDTOp);
-handle_crdt(false, _CRDTOp, _Vid, RObj) ->
-    RObj.
-
-do_crdt_update(RObj, VId, CRDTOp) ->
-    {Time, Value} = timer:tc(riak_kv_crdt, update, [RObj, VId, CRDTOp]),
-    riak_kv_stat:update({vnode_dt_update, get_crdt_mod(CRDTOp), Time}),
-    Value.
-
-get_crdt_mod(Int) when is_integer(Int) -> ?COUNTER_TYPE;
-get_crdt_mod(#crdt_op{mod=Mod}) -> Mod;
-get_crdt_mod(Atom) when is_atom(Atom) -> Atom.
-
 perform_put({fail, _, _}=Reply, State, _PutArgs) ->
     {Reply, State};
 perform_put({false, Obj},
@@ -1633,6 +1535,8 @@ perform_put({false, _Obj},
             #putargs{returnbody=false,
                      reqid=ReqId}) ->
     {{dw, Idx, ReqId}, State};
+perform_put({ok, Obj}, State, PutArgs) ->
+    perform_put({true, Obj}, State, PutArgs);
 perform_put({true, Obj},
             State,
             #putargs{returnbody=RB,
@@ -1642,7 +1546,7 @@ perform_put({true, Obj},
     {Reply, State2} = actual_put(BKey, Obj, IndexSpecs, RB, ReqID, State),
     {Reply, State2}.
 
-actual_put(BKey={Bucket, Key}, Obj, IndexSpecs, RB, ReqID,
+actual_put(_BKey={Bucket, Key}, Obj, IndexSpecs, RB, ReqID,
            State=#state{idx=Idx,
                         mod=Mod,
                         modstate=ModState}) ->
@@ -1650,7 +1554,7 @@ actual_put(BKey={Bucket, Key}, Obj, IndexSpecs, RB, ReqID,
                        do_max_check) of
         {{ok, UpdModState}, EncodedVal} ->
             update_hashtree(Bucket, Key, EncodedVal, State),
-            maybe_cache_object(BKey, Obj, State),
+            %maybe_cache_object(BKey, Obj, State),
             ?INDEX(Obj, put, Idx),
             case RB of
                 true ->
@@ -1740,8 +1644,9 @@ do_get(_Sender, BKey, ReqID,
     StartTS = os:timestamp(),
     {Retval, ModState1} = do_get_term(BKey, Mod, ModState),
     case Retval of
-        {ok, Obj} ->
-            maybe_cache_object(BKey, Obj, State);
+        {ok, _Obj} ->
+            %maybe_cache_object(BKey, Obj, State);
+            ok;
         _ ->
             ok
     end,
@@ -2364,7 +2269,8 @@ encode_and_put_no_sib_check(Obj, Mod, Bucket, Key, IndexSpecs, ModState,
             %% and errors themselves.
             Mod:put_object(Bucket, Key, IndexSpecs, Obj, ModState);
         false ->
-            ObjFmt = riak_core_capability:get({riak_kv, object_format}, v0),
+            %ObjFmt = riak_core_capability:get({riak_kv, object_format}, v0),
+            ObjFmt = v0,
             EncodedVal = riak_object:to_binary(ObjFmt, Obj),
             BinSize = size(EncodedVal),
             %% Report or fail on large objects
@@ -2452,65 +2358,12 @@ try_set_concurrency_limit(Lock, Limit, true) ->
             ok
     end.
 
-maybe_check_md_cache(Table, BKey) ->
-    case Table of
-        undefined ->
-            {undefined, undefined};
-        _ ->
-            case ets:lookup(Table, BKey) of
-                [{_TS, BKey, MD}] ->
-                    MD;
-                [] ->
-                    {undefined, undefined}
-            end
-    end.
-
-maybe_cache_object(BKey, Obj, #state{md_cache = MDCache,
-                                     md_cache_size = MDCacheSize}) ->
-    case MDCache of
-        undefined ->
-            ok;
-        _ ->
-            VClock = riak_object:vclock(Obj),
-            IndexData = riak_object:index_data(Obj),
-            insert_md_cache(MDCache, MDCacheSize, BKey, {VClock, IndexData})
-    end.
-
 maybe_cache_evict(BKey, #state{md_cache = MDCache}) ->
     case MDCache of
         undefined ->
             ok;
         _ ->
             ets:delete(MDCache, BKey)
-    end.
-
-insert_md_cache(Table, MaxSize, BKey, MD) ->
-    TS = os:timestamp(),
-    case ets:insert(Table, {TS, BKey, MD}) of
-        true ->
-            Size = ets:info(Table, memory),
-            case Size > MaxSize of
-                true ->
-                    trim_md_cache(Table, MaxSize);
-                false ->
-                    ok
-            end
-    end.
-
-trim_md_cache(Table, MaxSize) ->
-    Oldest = ets:first(Table),
-    case Oldest of
-        '$end_of_table' ->
-            ok;
-        BKey ->
-            ets:delete(Table, BKey),
-            Size = ets:info(Table, memory),
-            case Size > MaxSize of
-                true ->
-                    trim_md_cache(Table, MaxSize);
-                false ->
-                    ok
-            end
     end.
 
 new_md_cache(VId) ->
@@ -2556,8 +2409,8 @@ handle_pending_puts([], _Minimum, State) ->
 handle_pending_puts(Puts=[{TimeStamp, Operations}|Rest], Minimum, State0) ->
     case TimeStamp =< (Minimum + 1) of
     true ->
-        State = lists:foldl(fun(_Operation=?KV_PUT_PENDING{bkey=BKey, object=Object, req_id=ReqId, start_time=StartTime, options=Options, sender=Sender}, Acc)->
-                                do_put(Sender, BKey, Object, ReqId, StartTime, Options, Acc, no_clock, false)
+        State = lists:foldl(fun(_Operation=?KV_PUT_PENDING{bkey=BKey, operation=Operation, req_id=ReqId, start_time=StartTime, options=Options, sender=Sender}, Acc)->
+                                do_put(Sender, BKey, Operation, ReqId, StartTime, Options, Acc, TimeStamp, false)
                             end, State0, Operations),
         handle_pending_puts(Rest, Minimum, State);
     false ->
@@ -2570,7 +2423,6 @@ handle_pending_gets([], _Minimum, State) ->
 handle_pending_gets(Gets=[{TimeStamp, Operations}|Rest], Minimum, State0) ->
     case TimeStamp =< Minimum of
     true ->
-        lager:info("Operations are ~p", [Operations]),
         State = lists:foldl(fun(_Operation=?KV_GET_PENDING{bkey=BKey, req_id=ReqId, sender=Sender}, Acc0)->
                                 {reply, {r, Retval, Idx, ReqID}, Acc} = do_get(Sender, BKey, ReqId, Acc0),
                                 lager:info("Things to reply: {r, ~p, ~p, ~p}",[Retval, Idx, ReqID]),

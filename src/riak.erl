@@ -25,9 +25,8 @@
 -export([get_app_env/0, get_app_env/1,get_app_env/2]).
 -export([client_connect/1,client_connect/2,
          client_test/1,
-         client_write_test/2,
+         client_write_test/6,
          client_read_test/3,
-         client_new_object/3,
          local_client/0,local_client/1,
          join/1]).
 -export([code_hash/0]).
@@ -107,7 +106,6 @@ client_connect(Node, ClientId= <<_:32>>) ->
             %% or the new vnode based vclocks should be used.
             %% N.B. all nodes must be upgraded to 1.0 before
             %% this can be enabled.
-            lager:error("Using modified version"),
             case vnode_vclocks(Node) of
                 {badrpc, _Reason} ->
                     {error, {could_not_reach_node, Node}};
@@ -132,40 +130,17 @@ vnode_vclocks(Node) ->
             Result
     end.
 
-client_new_object(Node, Bucket, Key) ->
+client_write_test(Node, Bucket, CRDTType, Key, OperationName, Args) ->
     case net_adm:ping(Node) of
     pong ->
         case client_connect(Node) of
             {ok, Client} ->
-                Object = riak_object:new(Bucket, Key, undefined),
-                case Client:put(Object, 1) of
-                    ok ->
-                        ok;
+                case Client:causal_put({Bucket, Key}, {OperationName, Args}, 0, [{crdt_type, CRDTType}]) of
+                    {ok, TS} ->
+                        io:format("Success, time_stamp=~p\n",[TS]),
+                        {ok, TS};
                     Error ->
-                        io:format("Failed to write test value\n: ~p", [Error]),
-                        error
-                    end;
-            Error ->
-                io:format("Error creating client connection to ~s: ~p\n",[Node, Error]),
-                error
-            end;
-    pang ->
-        io:format("Node ~p is not reachable from ~p.\n", [Node, node()]),
-        error
-    end.
-    
-
-client_write_test(Node, Object) ->
-    case net_adm:ping(Node) of
-    pong ->
-        case client_connect(Node) of
-            {ok, Client} ->
-                case Client:put(Object, 1) of
-                    ok ->
-                        io:format("Success\n",[]),
-                        ok;
-                    Error ->
-                        io:format("Failed to write test value\n: ~p", [Error]),
+                        io:format("Failed to write test value: ~p\n", [Error]),
                         error
                     end;
             Error ->
@@ -182,7 +157,7 @@ client_read_test(Node, Bucket, Key) ->
     pong ->
         case client_connect(Node) of
             {ok, Client} ->
-                case Client:get(Bucket, Key, 1) of
+                case Client:causal_get(Bucket, 0, Key, []) of
                     {ok, Object} ->
                         io:format("Success\n",[]),
                         {ok, Object};
